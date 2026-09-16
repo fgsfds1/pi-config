@@ -417,7 +417,13 @@ function getPiInvocation(args: string[]): {
   const currentScript = process.argv[1];
   const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
   if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript, ...args] };
+    // Compiled single-file binary: argv[1] is the executable itself, so
+    // re-invoking must not duplicate it as the first argument.
+    const isExecutable = currentScript === process.execPath;
+    return {
+      command: process.execPath,
+      args: isExecutable ? args : [currentScript, ...args],
+    };
   }
   return { command: "pi", args };
 }
@@ -469,10 +475,11 @@ async function runSingleAgent(
   }
 
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  const inheritsDispatchConfig = !agent.model;
   const model = agent.model ?? dispatchDefaults.model;
   if (model) args.push("--model", model);
-  if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
+  // The session's thinking level always applies — agent frontmatter can
+  // override the model but not the thinking level.
+  if (dispatchDefaults.thinkingLevel) {
     args.push("--thinking", dispatchDefaults.thinkingLevel);
   }
   if (agent.tools && agent.tools.length > 0)
@@ -611,7 +618,8 @@ async function runSingleAgent(
 
       proc.on("close", (code) => {
         if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
+        // null means killed by a signal — treat as failure, not success
+        resolve(code ?? 1);
       });
 
       proc.on("error", () => resolve(1));
@@ -765,7 +773,7 @@ export default function (pi: ExtensionAPI) {
       agentScope: Type.Optional(
         Type.String({
           description:
-            'Agent scope: "user", "project", or "both". Default: "user".',
+            'Agent scope: "user", "project", or "both". Default: "both".',
         }),
       ),
       cwd: Type.Optional(
@@ -776,7 +784,7 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const agentScope = (params.agentScope ?? "user") as AgentScope;
+      const agentScope = (params.agentScope ?? "both") as AgentScope;
       const dispatchDefaults: DispatchDefaults = {
         model: ctx.model
           ? `${ctx.model.provider}/${ctx.model.id}`
