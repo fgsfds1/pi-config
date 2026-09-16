@@ -4,22 +4,25 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /**
- * Working checkout of this repo (where edits happen). Override with PI_SYNC_DIR.
- * Note: pi loads the *installed package clone* (~/.pi/agent/git/...), not this
- * checkout — so after pulling/pushing we also run `pi update --extensions`
- * and reload to apply changes on this device.
+ * This repo is installed as a pi git package, so pi keeps a live clone at
+ * ~/.pi/agent/git/github.com/<owner>/<repo> and loads resources directly from
+ * it. We treat that clone as the working copy: edit there, /sync-up to push,
+ * /sync to pull. Override the path with PI_SYNC_DIR.
+ *
+ * Note: `pi update --extensions` resets the clone to the remote when the
+ * remote moved — uncommitted edits are wiped in that case. /sync-up first.
  */
+const REPO = "fgfsfds1/pi-config";
 const SYNC_DIR =
-  process.env.PI_SYNC_DIR ?? join(homedir(), "projects", "pi-config");
-
-const REPO_SSH = "git@github.com:fgfsfds1/pi-config";
+  process.env.PI_SYNC_DIR ??
+  join(homedir(), ".pi", "agent", "git", "github.com", REPO);
 
 /**
  * Sync extension — keep this pi config in sync with GitHub.
  *
  * Commands:
- *   /sync          — pull latest from GitHub, update installed package, reload
- *   /sync-up [msg] — commit checkout changes, push, apply locally
+ *   /sync          — pull latest from GitHub and reload
+ *   /sync-up [msg] — commit changes in the clone, push, and reload
  */
 export default function (pi: ExtensionAPI) {
   const git = async (args: string[]): Promise<string> => {
@@ -30,44 +33,46 @@ export default function (pi: ExtensionAPI) {
     return result.stdout.trim();
   };
 
-  const missingCheckout = (ctx: { ui?: { notify: (m: string, t?: "info" | "warning" | "error") => void } }) => {
-    ctx.ui?.notify(
-      `Sync checkout not found at ${SYNC_DIR}.\n` +
-        `Clone it first: git clone ${REPO_SSH} ${SYNC_DIR}\n` +
-        `(or set PI_SYNC_DIR to your checkout path)`,
-      "warning",
-    );
+  type Ctx = {
+    ui?: { notify: (m: string, t?: "info" | "warning" | "error") => void };
+    reload: () => Promise<void>;
   };
 
-  /** Update the pi-managed package clone and reload. Returns true on success. */
-  const applyLocally = async (
-    ctx: { ui?: { notify: (m: string, t?: "info" | "warning" | "error") => void }; reload: () => Promise<void> },
-  ): Promise<boolean> => {
-    const update = await pi.exec("pi", ["update", "--extensions"], { timeout: 120_000 });
-    if (update.code !== 0) {
+  /** Verify SYNC_DIR is the pi package clone of this repo. */
+  const checkDir = async (ctx: Ctx): Promise<boolean> => {
+    if (!existsSync(join(SYNC_DIR, ".git"))) {
       ctx.ui?.notify(
-        `'pi update --extensions' failed: ${(update.stderr.trim() || update.stdout.trim()).slice(0, 300)} — run it manually`,
+        `Pi package clone not found at ${SYNC_DIR}.\n` +
+          `Install it first: pi install git:github.com/${REPO}\n` +
+          `(or set PI_SYNC_DIR to the clone path)`,
         "warning",
       );
       return false;
     }
-    await ctx.reload();
+    try {
+      const origin = await git(["remote", "get-url", "origin"]);
+      if (!origin.includes(REPO)) {
+        ctx.ui?.notify(
+          `${SYNC_DIR} is not a clone of ${REPO} (origin: ${origin}). Set PI_SYNC_DIR to the pi package clone.`,
+          "warning",
+        );
+        return false;
+      }
+    } catch {
+      // not a git repo with origin — existsSync already passed, continue
+    }
     return true;
   };
 
   pi.registerCommand("sync", {
-    description: "Pull latest pi config from GitHub, update installed package, and reload",
+    description: "Pull latest pi config from GitHub and reload",
     async handler(_args, ctx) {
       try {
-        if (!existsSync(join(SYNC_DIR, ".git"))) {
-          missingCheckout(ctx);
-          return;
-        }
+        if (!(await checkDir(ctx as Ctx))) return;
         await git(["pull", "--rebase", "--autostash"]);
         const head = await git(["rev-parse", "--short", "HEAD"]);
-        if (await applyLocally(ctx)) {
-          ctx.ui?.notify(`✓ Synced pi config to ${head}`, "info");
-        }
+        await (ctx as Ctx).reload();
+        ctx.ui?.notify(`✓ Synced pi config to ${head}`, "info");
       } catch (err) {
         ctx.ui?.notify(`Sync failed: ${err instanceof Error ? err.message : String(err)}`, "error");
       }
@@ -75,17 +80,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("sync-up", {
-    description: "Commit and push local pi config changes (argument = commit message)",
+    description: "Commit and push pi config changes (argument = commit message)",
     async handler(args, ctx) {
       try {
-        if (!existsSync(join(SYNC_DIR, ".git"))) {
-          missingCheckout(ctx);
-          return;
-        }
+        if (!(await checkDir(ctx as Ctx))) return;
         await git(["add", "-A"]);
         const status = await git(["status", "--porcelain"]);
         if (!status) {
-          ctx.ui?.notify("Nothing to sync — checkout is clean", "info");
+          ctx.ui?.notify("Nothing to sync — no changes", "info");
           return;
         }
         const message =
@@ -93,11 +95,8 @@ export default function (pi: ExtensionAPI) {
         await git(["commit", "-m", message]);
         await git(["push"]);
         const head = await git(["rev-parse", "--short", "HEAD"]);
-        if (await applyLocally(ctx)) {
-          ctx.ui?.notify(`✓ Pushed ${head} and applied locally`, "info");
-        } else {
-          ctx.ui?.notify(`✓ Pushed ${head}`, "info");
-        }
+        await (ctx as Ctx).reload();
+        ctx.ui?.notify(`✓ Pushed ${head} and reloaded`, "info");
       } catch (err) {
         ctx.ui?.notify(`Sync-up failed: ${err instanceof Error ? err.message : String(err)}`, "error");
       }

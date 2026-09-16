@@ -15,24 +15,26 @@ via GitHub. Installed as a pi package: extensions, prompt templates, and skills.
 3. **Optional, for pushing** (`/sync-up`): give the device write access —
    either add its SSH public key to GitHub, or configure a git credential
    (PAT) for `github.com`.
-4. **Optional, for editing**: clone a working checkout. The sync commands
-   operate on this checkout (default path `~/projects/pi-config`, override
-   with `PI_SYNC_DIR`):
-
-   ```sh
-   git clone git@github.com:fgfsfds1/pi-config ~/projects/pi-config
-   ```
 
 ## Syncing
 
+Pi keeps git packages in a live clone at
+`~/.pi/agent/git/github.com/fgfsfds1/pi-config` and loads resources directly
+from it — **that clone is the working copy**. Edit files there; no separate
+checkout needed. (Override the path with `PI_SYNC_DIR` if you move it.)
+
 | Command | What it does |
 |---|---|
-| `/sync` | Pull latest from GitHub → `pi update --extensions` → reload |
-| `/sync-up [message]` | `git add -A` + commit + push in the checkout → apply locally |
+| `/sync` | `git pull --rebase --autostash` in the clone → reload |
+| `/sync-up [message]` | `git add -A` + commit + push in the clone → reload |
 
-Workflow: edit files in the checkout, `/sync-up "what changed"`, then `/sync`
+Workflow: edit files in the clone, `/sync-up "what changed"`, then `/sync`
 on the other device. Conflicts are plain git conflicts — resolve in the
-checkout, then push.
+clone, then push.
+
+> **Caveat:** `pi update --extensions` / `pi update --all` reset the clone to
+> the remote when the remote has moved, wiping uncommitted edits. Run
+> `/sync-up` first if you have unsaved changes.
 
 ## Firecrawl
 
