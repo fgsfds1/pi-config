@@ -12,7 +12,7 @@ import { join } from "node:path";
  * Note: `pi update --extensions` resets the clone to the remote when the
  * remote moved — uncommitted edits are wiped in that case. /sync-up first.
  */
-const REPO = "fgfsfds1/pi-config";
+const REPO = "fgsfds1/pi-config";
 const SYNC_DIR =
   process.env.PI_SYNC_DIR ??
   join(homedir(), ".pi", "agent", "git", "github.com", REPO);

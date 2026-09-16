@@ -9,7 +9,7 @@ via GitHub. Installed as a pi package: extensions, prompt templates, and skills.
 2. Install this package — the repo is public, so **no auth is needed**:
 
    ```sh
-   pi install git:github.com/fgfsfds1/pi-config
+   pi install git:github.com/fgsfds1/pi-config
    ```
 
 3. **Optional, for pushing** (`/sync-up`): give the device write access —
@@ -19,7 +19,7 @@ via GitHub. Installed as a pi package: extensions, prompt templates, and skills.
 ## Syncing
 
 Pi keeps git packages in a live clone at
-`~/.pi/agent/git/github.com/fgfsfds1/pi-config` and loads resources directly
+`~/.pi/agent/git/github.com/fgsfds1/pi-config` and loads resources directly
 from it — **that clone is the working copy**. Edit files there; no separate
 checkout needed. (Override the path with `PI_SYNC_DIR` if you move it.)
 
