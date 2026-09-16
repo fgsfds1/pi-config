@@ -50,6 +50,9 @@ instance. Configure per device with `PI_FIRECRAWL_URL`:
 Set it in your shell profile (e.g. `~/.bashrc`), or disable per device with
 `pi config` (package resource filtering).
 
+If the instance requires an API key, set `PI_FIRECRAWL_API_KEY` — it is
+sent as a Bearer token on every request.
+
 ## Per-device files (not synced)
 
 These live in `~/.pi/agent/` and are intentionally **not** in this repo —

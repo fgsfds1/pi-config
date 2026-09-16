@@ -20,14 +20,67 @@ const FIRECRAWL_URL = (
   rawFirecrawlUrl === undefined ? "http://localhost:3002" : rawFirecrawlUrl.trim()
 ).replace(/\/+$/, "");
 const FIRECRAWL_ENABLED = FIRECRAWL_URL !== "" && FIRECRAWL_URL !== "off";
+const FIRECRAWL_KEY = process.env.PI_FIRECRAWL_API_KEY?.trim() || undefined;
 
 /**
  * Firecrawl extension — web search and page extraction via self-hosted Firecrawl.
  *
  * Tools:
- *   firecrawl_search   — search the web (POST /v1/search)
- *   firecrawl_extract  — extract page content as markdown (POST /v1/scrape)
+ *   web_search  — search the web (POST /v1/search)
+ *   web_extract — extract page content as markdown (POST /v1/scrape)
  */
+
+/**
+ * Map a model-friendly freshness value to Google's tbs time filter
+ * (the API has no "freshness" field — it rejects unknown keys with 400):
+ *   "day" → "qdr:d", "week" → "qdr:w", "7d" → "qdr:7d", "qdr:m" → passthrough
+ */
+function freshnessToTbs(freshness: string): string {
+  const f = freshness.trim().toLowerCase();
+  if (/^qdr:[a-z0-9]+$/i.test(f)) return f;
+  const named: Record<string, string> = {
+    hour: "qdr:h",
+    day: "qdr:d",
+    week: "qdr:w",
+    month: "qdr:m",
+    year: "qdr:y",
+  };
+  if (named[f]) return named[f];
+  const m = f.match(/^(\d+)([dhmy])$/);
+  if (m) return `qdr:${m[1]}${m[2]}`;
+  throw new Error(
+    `Invalid freshness "${freshness}". Use "day", "week", "month", "year", "7d", "30d", or a raw tbs value like "qdr:w".`,
+  );
+}
+
+async function firecrawlFetch<T>(
+  path: string,
+  payload: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (FIRECRAWL_KEY) headers.Authorization = `Bearer ${FIRECRAWL_KEY}`;
+  let response: Response;
+  try {
+    response = await fetch(`${FIRECRAWL_URL}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    throw new Error(
+      `Firecrawl unreachable at ${FIRECRAWL_URL}: ${(err as Error).message}`,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Firecrawl ${path} failed: ${response.status} ${response.statusText}`,
+    );
+  }
+  return (await response.json()) as T;
+}
 export default function (pi: ExtensionAPI) {
   if (!FIRECRAWL_ENABLED) return;
 
@@ -72,7 +125,7 @@ export default function (pi: ExtensionAPI) {
       tbs: Type.Optional(
         Type.String({
           description:
-            'Google time-based search string (e.g. "qdr:w" for this week)',
+            'Raw Google time-based search string (e.g. "qdr:w" for this week). Takes precedence over freshness.',
         }),
       ),
       filter: Type.Optional(
@@ -86,38 +139,40 @@ export default function (pi: ExtensionAPI) {
         query: params.query,
         limit: params.limit ?? 5,
       };
-      if (params.freshness) payload.freshness = params.freshness;
+      // The API has no "freshness" field — map it to Google's tbs filter.
+      // A raw tbs value takes precedence over freshness.
+      const tbs =
+        params.tbs ??
+        (params.freshness ? freshnessToTbs(params.freshness) : undefined);
+      if (tbs) payload.tbs = tbs;
       if (params.lang) payload.lang = params.lang;
       if (params.country) payload.country = params.country;
-      if (params.tbs) payload.tbs = params.tbs;
       if (params.filter) payload.filter = params.filter;
 
-      const response = await fetch(`${FIRECRAWL_URL}/v1/search`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal,
-      });
-
-      if (!response.ok) {
-        throw new Error(
-          `Firecrawl search failed: ${response.status} ${response.statusText}`,
-        );
-      }
-
-      const result = (await response.json()) as {
+      const result = await firecrawlFetch<{
         success: boolean;
+        error?: string;
         data?: Array<{ url: string; title: string; description: string }>;
-      };
+      }>("/v1/search", payload, signal);
 
-      if (!result.success || !result.data) {
+      if (!result.success) {
         return {
-          content: [{ type: "text", text: "Search returned no results." }],
-          details: { results: [] },
+          content: [
+            { type: "text", text: `Search failed: ${result.error ?? "unknown error"}` },
+          ],
+          details: { error: result.error ?? "search failed", results: [] },
         };
       }
 
-      const items = result.data;
+      const items = result.data ?? [];
+      if (items.length === 0) {
+        return {
+          content: [
+            { type: "text", text: `Search returned no results for "${params.query}".` },
+          ],
+          details: { results: [] },
+        };
+      }
       const lines = [`${items.length} result(s) found for "${params.query}":`];
 
       for (let i = 0; i < items.length; i++) {
@@ -172,14 +227,13 @@ export default function (pi: ExtensionAPI) {
       "Use web_extract to read full page content from a URL.",
       "Use web_extract after web_search to read the full content of search results.",
       "Use wait_seconds for JavaScript-heavy or slow-loading pages.",
-      "Use bypass for sites with anti-bot protection.",
       "Use selector to target specific page sections (e.g. 'article', 'main').",
     ],
     parameters: Type.Object({
       url: Type.String({ description: "URL to extract content from" }),
       format: Type.Optional(
         StringEnum(
-          ["markdown", "html", "links", "screenshot"] as const,
+          ["markdown", "html", "links"] as const,
           { description: "Output format (default: markdown)" },
         ),
       ),
@@ -193,17 +247,12 @@ export default function (pi: ExtensionAPI) {
       selector: Type.Optional(
         Type.String({
           description:
-            "CSS selector to extract (e.g. 'article', 'main', '.content')",
+            "HTML tag name to extract only (e.g. 'article', 'main')",
         }),
       ),
       include_links: Type.Optional(
         Type.Boolean({
           description: "Also extract links from the page (default: false)",
-        }),
-      ),
-      bypass: Type.Optional(
-        Type.Boolean({
-          description: "Enable anti-bot bypass (default: false)",
         }),
       ),
       mobile: Type.Optional(
@@ -224,43 +273,54 @@ export default function (pi: ExtensionAPI) {
         payload.waitFor = params.wait_seconds * 1000;
       }
       if (params.selector) {
-        payload.onlySelectors = [params.selector];
+        // The API filters by HTML tag name (includeTags), not CSS selectors
+        payload.includeTags = [params.selector];
       }
       if (params.mobile) payload.mobile = true;
-      if (params.bypass) payload.atsv = true;
 
-      const response = await fetch(`${FIRECRAWL_URL}/v1/scrape`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal,
-      });
-
-      if (!response.ok) {
-        throw new Error(
-          `Firecrawl extract failed: ${response.status} ${response.statusText}`,
-        );
-      }
-
-      const result = (await response.json()) as {
+      const result = await firecrawlFetch<{
         success: boolean;
+        error?: string;
         data?: {
           markdown?: string;
           html?: string;
           links?: string[];
           metadata?: Record<string, unknown>;
         };
-      };
+      }>("/v1/scrape", payload, signal);
 
       if (!result.success || !result.data) {
         return {
-          content: [{ type: "text", text: `Extraction failed for ${params.url}` }],
+          content: [
+            {
+              type: "text",
+              text: `Extraction failed for ${params.url}: ${result.error ?? "unknown error"}`,
+            },
+          ],
           details: { url: params.url, error: true },
         };
       }
 
       const data = result.data;
       const metadata = data.metadata ?? {};
+      const statusCode = metadata.statusCode as number | undefined;
+      const links = data.links;
+      const content = data.markdown ?? data.html ?? "";
+
+      if (!content && (!links || links.length === 0)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Extraction returned no content for ${params.url}` +
+                (statusCode !== undefined ? ` (HTTP ${statusCode})` : ""),
+            },
+          ],
+          details: { url: params.url, error: true, statusCode },
+        };
+      }
+
       const parts: string[] = [];
 
       const title = metadata.title as string | undefined;
@@ -269,8 +329,6 @@ export default function (pi: ExtensionAPI) {
         parts.push("");
       }
 
-      // Pick the primary content format
-      const content = data.markdown ?? data.html ?? "";
       if (content) {
         const truncation = truncateHead(content, {
           maxLines: DEFAULT_MAX_LINES,
@@ -286,7 +344,6 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      const links = data.links;
       if (links && links.length > 0) {
         parts.push("");
         parts.push(`Links (${links.length}):`);
@@ -321,7 +378,6 @@ export default function (pi: ExtensionAPI) {
         extras.push(`wait:${args.wait_seconds}s`);
       }
       if (args.selector) extras.push(`sel:${args.selector}`);
-      if (args.bypass) extras.push("bypass");
       if (extras.length > 0) {
         text += theme.fg("dim", ` [${extras.join(", ")}]`);
       }
