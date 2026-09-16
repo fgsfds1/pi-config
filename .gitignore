@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Per-device files — never commit (guards against copy-paste accidents)
+auth.json
+settings.json
+trust.json
+models-store.json
+sessions/
