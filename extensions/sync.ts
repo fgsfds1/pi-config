@@ -16,6 +16,7 @@ const REPO = "fgsfds1/pi-config";
 const SYNC_DIR =
   process.env.PI_SYNC_DIR ??
   join(homedir(), ".pi", "agent", "git", "github.com", REPO);
+const GIT_TIMEOUT_MS = 60_000;
 
 /**
  * Sync extension — keep this pi config in sync with GitHub.
@@ -26,9 +27,15 @@ const SYNC_DIR =
  */
 export default function (pi: ExtensionAPI) {
   const git = async (args: string[]): Promise<string> => {
-    const result = await pi.exec("git", args, { cwd: SYNC_DIR, timeout: 60_000 });
-    if (result.code !== 0) {
-      throw new Error(result.stderr.trim() || `git ${args[0]} exited with ${result.code}`);
+    const result = await pi.exec("git", args, { cwd: SYNC_DIR, timeout: GIT_TIMEOUT_MS });
+    // pi.exec maps a signal-killed exit (code: null) to 0 — a process killed
+    // by the timeout must not count as success.
+    if (result.code !== 0 || result.killed) {
+      throw new Error(
+        result.killed && !result.stderr
+          ? `git ${args[0]} timed out after ${GIT_TIMEOUT_MS / 1000}s`
+          : result.stderr.trim() || `git ${args[0]} exited with ${result.code}`,
+      );
     }
     return result.stdout.trim();
   };
@@ -36,6 +43,32 @@ export default function (pi: ExtensionAPI) {
   type Ctx = {
     ui?: { notify: (m: string, t?: "info" | "warning" | "error") => void };
     reload: () => Promise<void>;
+  };
+
+  const rebaseInProgress = (): boolean =>
+    existsSync(join(SYNC_DIR, ".git", "rebase-merge")) ||
+    existsSync(join(SYNC_DIR, ".git", "rebase-apply"));
+
+  /**
+   * Pull with rebase. A failed (or killed) pull can leave the clone
+   * mid-rebase, which makes every later git command fail until it is
+   * aborted — so abort on failure and say so in the error.
+   */
+  const pullRebase = async (): Promise<void> => {
+    try {
+      await git(["pull", "--rebase", "--autostash"]);
+    } catch (err) {
+      let extra = "";
+      if (rebaseInProgress()) {
+        try {
+          await git(["rebase", "--abort"]);
+          extra = " (rebase aborted, local state restored)";
+        } catch {
+          extra = ` (a rebase is still in progress — run \`git rebase --abort\` in ${SYNC_DIR})`;
+        }
+      }
+      throw new Error(`${err instanceof Error ? err.message : String(err)}${extra}`);
+    }
   };
 
   /** Verify SYNC_DIR is the pi package clone of this repo. */
@@ -69,12 +102,15 @@ export default function (pi: ExtensionAPI) {
     async handler(_args, ctx) {
       try {
         if (!(await checkDir(ctx as Ctx))) return;
-        await git(["pull", "--rebase", "--autostash"]);
+        await pullRebase();
         const head = await git(["rev-parse", "--short", "HEAD"]);
         await (ctx as Ctx).reload();
         ctx.ui?.notify(`✓ Synced pi config to ${head}`, "info");
       } catch (err) {
-        ctx.ui?.notify(`Sync failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+        ctx.ui?.notify(
+          `Sync failed: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
       }
     },
   });
@@ -86,17 +122,42 @@ export default function (pi: ExtensionAPI) {
         if (!(await checkDir(ctx as Ctx))) return;
         await git(["add", "-A"]);
         const status = await git(["status", "--porcelain"]);
-        if (!status) {
-          ctx.ui?.notify("Nothing to sync — no changes", "info");
+        // @{u} is a cached ref — fetch so the ahead/behind counts are real.
+        await git(["fetch"]);
+        // Commits left behind when an earlier push died (e.g. timed out
+        // mid-transfer) — the tree is clean but HEAD is ahead of origin.
+        const unpushed = await git(["rev-list", "--count", "@{u}..HEAD"]).catch(
+          () => "0",
+        );
+        const behind = await git(["rev-list", "--count", "HEAD..@{u}"]).catch(() => "0");
+        if (!status && unpushed === "0") {
+          ctx.ui?.notify(
+            behind !== "0"
+              ? `Nothing to push — remote has ${behind} new commit(s), run /sync to pull`
+              : "Nothing to sync — no changes",
+            "info",
+          );
           return;
         }
         const message =
           args.trim() || `sync: ${new Date().toISOString().slice(0, 16).replace("T", " ")}`;
-        await git(["commit", "-m", message]);
+        if (status) {
+          await git(["commit", "-m", message]);
+        }
+        // The remote may have moved (e.g. edited on another device) — rebase
+        // local commits on top so the push is a fast-forward.
+        if (behind !== "0") {
+          await pullRebase();
+        }
         await git(["push"]);
         const head = await git(["rev-parse", "--short", "HEAD"]);
         await (ctx as Ctx).reload();
-        ctx.ui?.notify(`✓ Pushed ${head} and reloaded`, "info");
+        ctx.ui?.notify(
+          status
+            ? `✓ Pushed ${head} and reloaded`
+            : `✓ Pushed ${unpushed} pending commit(s) and reloaded`,
+          "info",
+        );
       } catch (err) {
         ctx.ui?.notify(`Sync-up failed: ${err instanceof Error ? err.message : String(err)}`, "error");
       }
