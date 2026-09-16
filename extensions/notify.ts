@@ -11,7 +11,8 @@
  *   Windows — PowerShell [System.Windows.Forms]
  */
 
-import { spawn, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
+import { platform } from "node:os";
 import { promisify } from "util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -21,7 +22,6 @@ const execAsync = promisify(execFile);
 type Platform = "macos" | "linux" | "windows" | "unknown";
 
 function detectPlatform(): Platform {
-  const { platform } = require("node:os");
   if (platform() === "darwin") return "macos";
   if (platform() === "win32") return "windows";
   return "linux";
@@ -60,13 +60,10 @@ async function playSound(): Promise<void> {
     ];
     for (const [cmd, args] of players) {
       try {
-        // Use spawn with detached + unref for fire-and-forget
-        // execFile with stdio:ignore can fail silently for audio
-        const child = spawn(cmd, args, {
-          stdio: "ignore",
-          detached: true,
-        });
-        child.unref();
+        // Await exit so a missing binary or sound file falls through to the
+        // next player. (spawn + unref without an 'error' listener would throw
+        // an uncaught ENOENT in the parent process.)
+        await execAsync(cmd, args, { stdio: "ignore", timeout: 5000 });
         return;
       } catch {
         continue;
@@ -117,17 +114,13 @@ async function sendNotification(
 
   if (platform === "linux") {
     try {
-      // Try notify-send (libnotify)
-      const escapedTitle = title.replace(/'/g, "'\\''");
-      const escapedBody = body.replace(/'/g, "'\\''");
-      await execAsync(
-        "notify-send",
-        [escapedTitle, escapedBody],
-        { stdio: ["ignore", "ignore", "ignore"], timeout: 5000 },
-      );
+      // execFile passes argv directly (no shell) — no escaping needed
+      await execAsync("notify-send", [title, body], {
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 5000,
+      });
       return true;
     } catch {
-      // Fallback: try notify-desktop or just log
       return false;
     }
   }
@@ -140,7 +133,7 @@ async function sendNotification(
         "powershell.exe",
         [
           "-Command",
-          `[System.Windows.Forms.MessageBox]::Show("${escapedBody}", "${escapedTitle}")`,
+          `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show("${escapedBody}", "${escapedTitle}")`,
         ],
         { stdio: ["ignore", "ignore", "ignore"], timeout: 5000 },
       );
@@ -193,25 +186,30 @@ async function notify(
   config: NotifyConfig,
   title: string,
   body: string,
-): Promise<void> {
-  if (!shouldNotify(config)) return;
+): Promise<boolean> {
+  if (!shouldNotify(config)) return false;
 
-  const tasks: Promise<unknown>[] = [];
+  const tasks: Promise<boolean>[] = [];
 
   if (config.sound) {
-    tasks.push(playSound().catch(() => {}));
+    tasks.push(playSound().then(() => true).catch(() => false));
   }
 
   if (config.desktop) {
-    tasks.push(sendNotification(title, body).catch(() => {}));
+    tasks.push(sendNotification(title, body).catch(() => false));
   }
 
+  let tuiDelivered = false;
   if (config.tui && ctx.ui?.notify) {
     ctx.ui.notify(`${title}: ${body}`, "info");
+    tuiDelivered = true;
   }
 
-  await Promise.allSettled(tasks);
-  markNotified();
+  const results = await Promise.all(tasks);
+  const delivered = tuiDelivered || results.some(Boolean);
+  // Only consume the quiet window when something actually went out
+  if (delivered) markNotified();
+  return delivered;
 }
 
 // --- Extension ---
@@ -276,27 +274,25 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const playSoundFlag = params.sound !== false;
       const adHocConfig: NotifyConfig = {
         ...config,
-        sound: playSoundFlag,
+        sound: params.sound !== false,
         enabled: true, // always allow manual notify
+        quietAfterMinutes: 0, // manual notifications bypass the quiet window
       };
 
-      // Override quiet period for manual notifications
-      const originalQuiet = adHocConfig.quietAfterMinutes;
-      adHocConfig.quietAfterMinutes = 0;
-
-      await notify(ctx, adHocConfig, params.title, params.message);
-
-      // Restore
-      adHocConfig.quietAfterMinutes = originalQuiet;
+      const delivered = await notify(ctx, adHocConfig, params.title, params.message);
 
       return {
         content: [
-          { type: "text", text: `Notification sent: ${params.title}` },
+          {
+            type: "text",
+            text: delivered
+              ? `Notification sent: ${params.title}`
+              : `Notification not delivered (desktop and sound backends unavailable): ${params.title}`,
+          },
         ],
-        details: { title: params.title, message: params.message },
+        details: { title: params.title, message: params.message, delivered },
       };
     },
   });
