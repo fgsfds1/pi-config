@@ -1,17 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execFile, spawn } from "child_process";
-import { promisify } from "util";
+import { spawn } from "child_process";
 import {
   truncateHead,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
-  formatSize,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
-
-const execFileAsync = promisify(execFile);
 
 /**
  * In-memory store for spawned (async) processes.
@@ -39,188 +35,14 @@ function getSessionMap(sessionId: string) {
 }
 
 /**
- * Subprocess extension — run commands synchronously or spawn them in the background.
+ * Subprocess extension — spawn commands in the background and manage them.
  *
  * Tools:
- *   subprocess_run   — run a command, wait for output, return stdout/stderr/exit code
  *   subprocess_spawn — start a command in the background, returns a process ID
  *   subprocess_status — check status of a spawned process
  *   subprocess_kill   — kill a spawned process
  */
 export default function (pi: ExtensionAPI) {
-  // --- Sync run tool ---
-  pi.registerTool({
-    name: "subprocess_run",
-    label: "Subprocess Run",
-    description:
-      "Run a command synchronously and wait for it to complete. " +
-      "Returns stdout, stderr, and exit code. Use for quick commands like git status, ls, cat, etc.",
-    promptSnippet:
-      "Run a subprocess synchronously — waits for output, returns stdout/stderr/exit code",
-    promptGuidelines: [
-      "Use subprocess_run for quick commands that complete in under 30 seconds.",
-      "Use subprocess_spawn for long-running processes (servers, watchers, daemons).",
-      "For shell pipes/redirections, use shell: true with a single command string.",
-    ],
-    parameters: Type.Object({
-      command: Type.String({
-        description:
-          "Command to run (e.g. 'git status', 'ls -la', 'npm run build')",
-      }),
-      cwd: Type.Optional(
-        Type.String({
-          description: "Working directory (default: current working directory)",
-        }),
-      ),
-      timeout: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          maximum: 300,
-          description: "Timeout in seconds (default: 30)",
-        }),
-      ),
-      env: Type.Optional(
-        Type.Record(Type.String(), Type.String(), {
-          description: "Additional environment variables as key-value pairs",
-        }),
-      ),
-      shell: Type.Optional(
-        Type.Boolean({
-          description:
-            "Use shell execution for pipes/redirections (default: true)",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, signal) {
-      const timeoutMs = (params.timeout ?? 30) * 1000;
-      const cwd = params.cwd ?? process.cwd();
-      const env = params.env
-        ? { ...process.env, ...params.env }
-        : process.env;
-      const useShell = params.shell !== false; // default true
-
-      const options: Record<string, unknown> = {
-        cwd,
-        env,
-        timeout: timeoutMs,
-        maxBuffer: DEFAULT_MAX_BYTES * 2,
-        signal,
-      };
-      if (useShell) {
-        options.shell = true;
-      }
-
-      try {
-        const { stdout, stderr } = await execFileAsync(
-          params.command,
-          [],
-          options as Parameters<typeof execFileAsync>[2],
-        );
-
-        const stdoutTrunc = truncateHead(stdout, {
-          maxLines: DEFAULT_MAX_LINES,
-          maxBytes: DEFAULT_MAX_BYTES,
-        });
-        const stderrTrunc = truncateHead(stderr, {
-          maxLines: DEFAULT_MAX_LINES,
-          maxBytes: DEFAULT_MAX_BYTES,
-        });
-
-        let output = `Exit code: 0\n`;
-        if (stdoutTrunc.content) {
-          output += `\n--- stdout ---\n${stdoutTrunc.content}`;
-          if (stdoutTrunc.truncated) {
-            output += `\n[truncated: ${stdoutTrunc.outputLines} of ${stdoutTrunc.totalLines} lines]`;
-          }
-        }
-        if (stderrTrunc.content) {
-          output += `\n\n--- stderr ---\n${stderrTrunc.content}`;
-          if (stderrTrunc.truncated) {
-            output += `\n[truncated: ${stderrTrunc.outputLines} of ${stderrTrunc.totalLines} lines]`;
-          }
-        }
-
-        return {
-          content: [{ type: "text", text: output }],
-          details: {
-            command: params.command,
-            exitCode: 0,
-            stdoutLines: stdoutTrunc.totalLines,
-            stderrLines: stderrTrunc.totalLines,
-            stdoutBytes: stdoutTrunc.totalBytes,
-            stderrBytes: stderrTrunc.totalBytes,
-          },
-        };
-      } catch (err: unknown) {
-        const error = err as { code?: string; signal?: string; stdout?: string; stderr?: string };
-        const exitCode = error.code ?? -1;
-        const stdout = error.stdout ?? "";
-        const stderr = error.stderr ?? "";
-
-        const stdoutTrunc = truncateHead(stdout, {
-          maxLines: DEFAULT_MAX_LINES,
-          maxBytes: DEFAULT_MAX_BYTES,
-        });
-        const stderrTrunc = truncateHead(stderr, {
-          maxLines: DEFAULT_MAX_LINES,
-          maxBytes: DEFAULT_MAX_BYTES,
-        });
-
-        let output = `Exit code: ${exitCode}`;
-        if (error.signal) output += ` (killed by ${error.signal})`;
-        output += "\n";
-
-        if (stdoutTrunc.content) {
-          output += `\n--- stdout ---\n${stdoutTrunc.content}`;
-        }
-        if (stderrTrunc.content) {
-          output += `\n--- stderr ---\n${stderrTrunc.content}`;
-        }
-
-        return {
-          content: [{ type: "text", text: output }],
-          details: {
-            command: params.command,
-            exitCode,
-            stdoutLines: stdoutTrunc.totalLines,
-            stderrLines: stderrTrunc.totalLines,
-          },
-        };
-      }
-    },
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("subprocess_run "));
-      text += theme.fg("muted", args.command);
-      if (args.cwd) {
-        text += theme.fg("dim", ` (cwd: ${args.cwd})`);
-      }
-      if (args.timeout && args.timeout !== 30) {
-        text += theme.fg("dim", ` timeout:${args.timeout}s`);
-      }
-      return new Text(text, 0, 0);
-    },
-    renderResult(result, { expanded }, theme) {
-      const details = result.details as {
-        exitCode: number;
-        stdoutLines?: number;
-        stderrLines?: number;
-      } | undefined;
-      const exitCode = details?.exitCode ?? -1;
-      if (exitCode === 0) {
-        let text = theme.fg("success", "✓ Exit 0");
-        if (!expanded && details?.stdoutLines) {
-          text += theme.fg("dim", ` (${details.stdoutLines} lines)`);
-        }
-        return new Text(text, 0, 0);
-      }
-      let text = theme.fg("error", `✗ Exit ${exitCode}`);
-      if (!expanded && details?.stderrLines) {
-        text += theme.fg("dim", ` (${details.stderrLines} stderr lines)`);
-      }
-      return new Text(text, 0, 0);
-    },
-  });
-
   // --- Async spawn tool ---
   pi.registerTool({
     name: "subprocess_spawn",
