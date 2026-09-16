@@ -80,8 +80,8 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, signal) {
-      const sessionId = _toolCallId.slice(0, 8);
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
       const processId = randomUUID().slice(0, 8);
       const cwd = params.cwd ?? process.cwd();
       const env = params.env
@@ -93,7 +93,8 @@ export default function (pi: ExtensionAPI) {
         cwd,
         env,
         stdio: "pipe",
-        detached: false,
+        // Own process group on Unix so subprocess_kill can kill the whole tree
+        detached: process.platform !== "win32",
       };
       if (useShell) {
         options.shell = true;
@@ -127,7 +128,8 @@ export default function (pi: ExtensionAPI) {
       });
 
       child.on("exit", (code) => {
-        record.exitCode = code;
+        // code is null when killed by a signal — keep any code we recorded (e.g. -1 from subprocess_kill)
+        record.exitCode = code ?? record.exitCode ?? -1;
         record.done = true;
       });
 
@@ -201,8 +203,8 @@ export default function (pi: ExtensionAPI) {
         description: "Process ID returned by subprocess_spawn",
       }),
     }),
-    async execute(_toolCallId, params) {
-      const sessionId = _toolCallId.slice(0, 8);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
       const map = getSessionMap(sessionId);
       const record = map.get(params.process_id);
 
@@ -269,8 +271,8 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params) {
-      const sessionId = _toolCallId.slice(0, 8);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const sessionId = ctx.sessionManager.getSessionId();
       let record: SpawnRecord | undefined;
       let map: Map<string, SpawnRecord> | undefined;
 
@@ -309,7 +311,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
-        process.kill(record.pid, params.signal ?? "SIGTERM");
+        killProcessTree(record.pid, params.signal ?? "SIGTERM");
         record.done = true;
         record.exitCode = -1;
         return {
@@ -354,6 +356,41 @@ export default function (pi: ExtensionAPI) {
       return new Text(theme.fg("muted", "Kill result"), 0, 0);
     },
   });
+}
+
+/**
+ * Kill a process and all its children: process-group kill on Unix,
+ * taskkill /T on Windows. Falls back to killing the child alone.
+ */
+function killProcessTree(pid: number, signal: string) {
+  if (process.platform === "win32") {
+    // /T kills the whole tree; /F forces (SIGKILL equivalent)
+    try {
+      const killer = spawn(
+        "taskkill",
+        signal === "SIGKILL"
+          ? ["/F", "/T", "/PID", String(pid)]
+          : ["/T", "/PID", String(pid)],
+        { stdio: "ignore", detached: true, windowsHide: true },
+      );
+      killer.on("error", () => { /* fall through */ });
+      return;
+    } catch {
+      /* fall through to plain kill */
+    }
+  } else {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      /* fall through to plain kill */
+    }
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // process already gone
+  }
 }
 
 function formatSpawnStatus(record: SpawnRecord) {
