@@ -11,7 +11,8 @@
  *   clipboard_write — write text to clipboard
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { platform } from "node:os";
 import { promisify } from "util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -24,10 +25,13 @@ import { Type } from "typebox";
 
 const execAsync = promisify(execFile);
 
+// Clipboard contents can be large (whole files); the read tool truncates
+// its output anyway, so read generously and let truncation handle display.
+const READ_MAX_BUFFER = 10 * 1024 * 1024;
+
 type Platform = "macos" | "linux-wayland" | "linux-x11" | "windows" | "unknown";
 
 function detectPlatform(): Platform {
-  const { platform } = require("node:os");
   if (platform() === "darwin") return "macos";
   if (platform() === "win32") return "windows";
   // Linux — check for Wayland first, then X11
@@ -53,7 +57,7 @@ function getClipboardCommands(platform: Platform): {
     case "linux-wayland":
       return {
         read: ["wl-paste", ["--no-newline"]],
-        write: ["wl-copy", ["--trim-newline"]], // text passed as arg, not stdin
+        write: ["wl-copy", ["--trim-newline"]],
       };
     case "linux-x11":
       return {
@@ -62,7 +66,7 @@ function getClipboardCommands(platform: Platform): {
       };
     case "windows":
       return {
-        read: ["powershell.exe", ["-Command", "Get-Clipboard"]],
+        read: ["powershell.exe", ["-Command", "Get-Clipboard -Raw"]],
         write: ["clip", []],
       };
     default:
@@ -75,14 +79,12 @@ function getClipboardCommands(platform: Platform): {
 
 async function tryCommand(
   cmd: [string, string[]],
-  input?: string,
 ): Promise<{ stdout: string; stderr: string; success: boolean }> {
   try {
     const { stdout, stderr } = await execAsync(cmd[0], cmd[1], {
-      maxBuffer: DEFAULT_MAX_BYTES * 4,
+      maxBuffer: READ_MAX_BUFFER,
       timeout: 5000,
     });
-    // For write commands that read from stdin
     return { stdout: stdout || "", stderr, success: true };
   } catch (err: unknown) {
     const error = err as { code?: string; stderr?: string };
@@ -102,13 +104,7 @@ async function readClipboard(): Promise<{
   const platform = detectPlatform();
   const commands = getClipboardCommands(platform);
 
-  // Try primary command
-  let result = await tryCommand(commands.read);
-  if (result.success && result.stdout) {
-    return { text: result.stdout, platform };
-  }
-
-  // Fallback: try alternative clipboard tools
+  // Cross-tool fallback: a Wayland session may still have xclip, and vice versa.
   const fallbacks: Array<[string, string[]]> = [];
   if (platform === "linux-wayland") {
     fallbacks.push(["xclip", ["-selection", "clipboard", "-o"]]);
@@ -116,20 +112,75 @@ async function readClipboard(): Promise<{
     fallbacks.push(["wl-paste", ["--no-newline"]]);
   }
 
-  for (const fallback of fallbacks) {
-    result = await tryCommand(fallback);
-    if (result.success && result.stdout) {
+  let lastError = "";
+  for (const attempt of [commands.read, ...fallbacks]) {
+    const result = await tryCommand(attempt);
+    if (result.success) {
+      // Success with empty output means the clipboard is empty — not a failure
       return { text: result.stdout, platform };
     }
+    lastError = result.stderr;
   }
 
   return {
     text: "",
     platform,
-    error:
-      result.stderr ||
-      "No clipboard tool found. Install wl-clipboard, xclip, or use macOS.",
+    error: lastError || "No clipboard tool found. Install wl-clipboard or xclip.",
   };
+}
+
+/**
+ * Spawn a clipboard writer that reads its input from stdin.
+ *
+ * Text goes through stdin (not argv) so arbitrarily large content works —
+ * a single argv element over ~128KB fails with E2BIG.
+ *
+ * stdout/stderr are ignored (not piped): clipboard tools fork a daemon to
+ * serve the selection, and a piped stdout inherited by that daemon would
+ * keep the child's 'close' event pending forever.
+ *
+ * A safety timer resolves with success if the parent hasn't exited within
+ * `timeoutMs` — by then the selection is set and the daemon holds it.
+ */
+function spawnWrite(
+  cmd: string,
+  args: string[],
+  text: string,
+  platform: Platform,
+  options?: { shell?: boolean; timeoutMs?: number },
+): Promise<{ success: boolean; platform: Platform; error?: string }> {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = (success: boolean, error?: string) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      resolve({ success, platform, error });
+    };
+    const child = spawn(cmd, args, {
+      stdio: ["pipe", "ignore", "ignore"],
+      shell: options?.shell,
+    });
+    const timer = setTimeout(
+      () => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        done(true); // assume OK — the selection was set before the hang
+      },
+      options?.timeoutMs ?? 2000,
+    );
+    child.on("error", (err: Error) => done(false, err.message || "spawn failed"));
+    child.on("close", (code: number | null) =>
+      done(
+        code === 0 || code === null,
+        code ? `${cmd} exited with code ${code}` : undefined,
+      ),
+    );
+    child.stdin.on("error", () => {}); // EPIPE if the writer dies early
+    child.stdin.write(text);
+    child.stdin.end();
+  });
 }
 
 async function writeClipboard(text: string): Promise<{
@@ -139,151 +190,33 @@ async function writeClipboard(text: string): Promise<{
 }> {
   const platform = detectPlatform();
 
-  // macOS: pbcopy reads from stdin (works fine)
   if (platform === "macos") {
-    const { spawn } = require("node:child_process");
-    return new Promise((resolve) => {
-      const child = spawn("pbcopy", []);
-      let error = "";
-      child.stderr.on("data", (data: Buffer) => { error += data.toString(); });
-      child.on("error", (err: Error) => {
-        resolve({ success: false, platform, error: err.message || "spawn failed" });
-      });
-      child.on("close", (code: number | null) => {
-        resolve({
-          success: code === 0,
-          platform,
-          error: code !== 0 ? error || "pbcopy failed" : undefined,
-        });
-      });
-      child.stdin.write(text);
-      child.stdin.end();
-    });
+    return spawnWrite("pbcopy", [], text, platform);
   }
 
-  // Windows: clip reads from stdin
   if (platform === "windows") {
-    const { spawn } = require("node:child_process");
-    return new Promise((resolve) => {
-      const child = spawn("clip", [], { shell: true });
-      let error = "";
-      child.stderr.on("data", (data: Buffer) => { error += data.toString(); });
-      child.on("error", (err: Error) => {
-        resolve({ success: false, platform, error: err.message || "spawn failed" });
-      });
-      child.on("close", (code: number | null) => {
-        resolve({
-          success: code === 0,
-          platform,
-          error: code !== 0 ? error || "clip failed" : undefined,
-        });
-      });
-      child.stdin.write(text);
-      child.stdin.end();
-    });
+    return spawnWrite("clip", [], text, platform, { shell: true });
   }
 
-  // Linux: pass text as command argument to avoid stdin/tty conflicts
-  // wl-copy and xclip both support this
   const commands = getClipboardCommands(platform);
   const [cmd, baseArgs] = commands.write;
-  const { spawn } = require("node:child_process");
 
-  // For wl-copy: pass text as positional argument.
-  // CRITICAL: wl-copy forks a daemon that inherits stdout/stderr.
-  // Using execFile (which captures stdout/stderr via pipes) causes the
-  // parent to wait for EOF forever → unkillable hang.
-  // Solution: use spawn with stdio ["ignore", "ignore", "ignore"] + timeout.
   if (cmd === "wl-copy") {
-    return new Promise((resolve) => {
-      const child = spawn(cmd, [...baseArgs, text], {
-        stdio: ["ignore", "ignore", "ignore"],
-        timeout: 3000,
-      });
-      let resolved = false;
-      const timers = [
-        setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            try { child.kill("SIGKILL"); } catch {}
-            resolve({ success: true, platform }); // assume OK if it spawned
-          }
-        }, 2000),
-      ];
-      child.on("close", (code: number | null) => {
-        if (resolved) return;
-        resolved = true;
-        timers.forEach(clearTimeout);
-        resolve({
-          success: code === 0 || code === null,
-          platform,
-          error: code && code !== 0 ? "wl-copy exited with code " + code : undefined,
-        });
-      });
-      child.on("error", (err: Error) => {
-        if (resolved) return;
-        resolved = true;
-        timers.forEach(clearTimeout);
-        // Fallback to xclip
-        try {
-          const fb = spawn("xclip", ["-selection", "clipboard", "-i"], {
-            stdio: ["pipe", "ignore", "ignore"],
-          });
-          let fbResolved = false;
-          fb.on("error", () => {
-            if (!fbResolved) {
-              fbResolved = true;
-              resolve({ success: false, platform, error: "xclip fallback failed" });
-            }
-          });
-          fb.on("close", (fbCode: number | null) => {
-            if (!fbResolved) {
-              fbResolved = true;
-              resolve({ success: fbCode === 0, platform, error: fbCode !== 0 ? "xclip failed" : undefined });
-            }
-          });
-          fb.stdin.write(text);
-          fb.stdin.end();
-        } catch {
-          resolve({ success: false, platform, error: err.message || "spawn failed" });
-        }
-      });
-    });
+    const result = await spawnWrite(cmd, baseArgs, text, platform);
+    if (result.success) return result;
+    // wl-copy missing or failed — fall back to xclip if available
+    const fb = await spawnWrite(
+      "xclip",
+      ["-selection", "clipboard", "-i"],
+      text,
+      platform,
+    );
+    if (fb.success) return fb;
+    return { success: false, platform, error: result.error };
   }
 
-  // xclip: reads from stdin, no forking issues
   if (cmd === "xclip") {
-    return new Promise((resolve) => {
-      const child = spawn(cmd, baseArgs, {
-        stdio: ["pipe", "ignore", "ignore"],
-      });
-      let resolved = false;
-      const timer = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          try { child.kill("SIGKILL"); } catch {}
-          resolve({ success: true, platform }); // assume OK
-        }
-      }, 2000);
-      child.on("error", (err: Error) => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timer);
-        resolve({ success: false, platform, error: err.message || "spawn failed" });
-      });
-      child.on("close", (code: number | null) => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timer);
-        resolve({
-          success: code === 0,
-          platform,
-          error: code !== 0 ? "xclip failed" : undefined,
-        });
-      });
-      child.stdin.write(text);
-      child.stdin.end();
-    });
+    return spawnWrite(cmd, baseArgs, text, platform);
   }
 
   return { success: false, platform, error: "Unknown clipboard command" };
