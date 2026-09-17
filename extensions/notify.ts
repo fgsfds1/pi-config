@@ -1,21 +1,32 @@
 /**
- * Notify extension — desktop notifications + sound when the agent needs your input.
+ * Notify extension вЂ” desktop notifications + sound when the agent needs your input.
  *
  * Hooks into pi's lifecycle events to send OS-level notifications:
- *   - turn_end       → notification when the agent finishes a turn
- *   - agent_settled  → notification when the agent is fully done
+ *   - turn_end       в†’ notification when the agent finishes a turn
+ *   - agent_settled  в†’ notification when the agent is fully done
  *
- * Platform support:
- *   Linux  — notify-send (libnotify) + canberra-gtk-play / paplay
- *   macOS  — osascript (Notification Center) + afplay
- *   Windows — PowerShell [System.Windows.Forms]
+ * Delivery channels (OS-native first, terminal fallback when unavailable):
+ *   Linux   вЂ” notify-send (libnotify, only when DESKTOP_SESSION is set) + paplay / canberra-gtk-play
+ *   macOS   вЂ” osascript (Notification Center) + afplay
+ *   Windows вЂ” Windows Terminal toast (WT_SESSION) or PowerShell MessageBox + SystemSounds
+ *   Terminal вЂ” OSC 99 (kitty) / OSC 777 (kitty format, e.g. Ghostty) escape sequences,
+ *              used when the OS channel is unavailable or fails (headless/SSH setups)
+ *
+ * Env config:
+ *   PI_NOTIFY_ENABLED=false, PI_NOTIFY_SOUND=false, PI_NOTIFY_DESKTOP=false,
+ *   PI_NOTIFY_TUI=false, PI_NOTIFY_TURN_END=true, PI_NOTIFY_AGENT_SETTLED=false,
+ *   PI_NOTIFY_QUIET_MINUTES=2, PI_NOTIFY_TERMINAL=auto|off, PI_NOTIFY_DEDUP=quiet|run
+ *
+ * Dedup modes (PI_NOTIFY_DEDUP):
+ *   quiet (default) вЂ” at most one notification per quiet window
+ *   run             вЂ” at most one notification per agent run (reset on agent_start)
  */
 
 import { execFile } from "node:child_process";
+import { closeSync, openSync, writeSync } from "node:fs";
 import { platform } from "node:os";
 import { promisify } from "util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 
 const execAsync = promisify(execFile);
 
@@ -87,6 +98,47 @@ async function playSound(): Promise<void> {
   }
 }
 
+// --- Terminal escape sequences (headless/SSH and terminal-only setups) ---
+
+function writeRawToTerminal(data: Buffer): boolean {
+  try {
+    const ttyFd = openSync("/dev/tty", "w");
+    try {
+      writeSync(ttyFd, data);
+    } finally {
+      closeSync(ttyFd);
+    }
+    return true;
+  } catch {
+    try {
+      writeSync(2, data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function notifyOSC777(title: string, body: string): boolean {
+  // kitty-format notification вЂ” supported by kitty and Ghostty
+  return writeRawToTerminal(Buffer.from(`\x1b]777;notify;${title};${body}\x07`));
+}
+
+function notifyOSC99(title: string, body: string): boolean {
+  // xterm-extended notification (title then body payload)
+  if (!writeRawToTerminal(Buffer.from(`\x1b]99;i=1;d=0;${title}\x1b\\`))) return false;
+  return writeRawToTerminal(Buffer.from(`\x1b]99;i=1:p=body;${body}\x1b\\`));
+}
+
+/**
+ * Terminal fallback. Picks OSC 99 in kitty (KITTY_WINDOW_ID), OSC 777
+ * otherwise (works in Ghostty and kitty).
+ */
+function notifyTerminal(title: string, body: string): boolean {
+  if (process.env.KITTY_WINDOW_ID) return notifyOSC99(title, body);
+  return notifyOSC777(title, body);
+}
+
 // --- Desktop notification ---
 async function sendNotification(
   title: string,
@@ -113,9 +165,20 @@ async function sendNotification(
   }
 
   if (platform === "linux") {
+    // No desktop session (headless/SSH) вЂ” let the caller fall back to the
+    // terminal instead of handing the notification to a daemon nobody sees.
+    if (!process.env.DESKTOP_SESSION) return false;
     try {
-      // execFile passes argv directly (no shell) — no escaping needed
-      await execAsync("notify-send", [title, body], {
+      // execFile passes argv directly (no shell) вЂ” no escaping needed.
+      // -a groups it under the "Pi" app, the sound hint lets the DE play a
+      // notification sound even without paplay/canberra available.
+      await execAsync("notify-send", [
+        "-u", "normal",
+        "-h", "string:sound-name:message",
+        "-a", "Pi",
+        title,
+        body,
+      ], {
         stdio: ["ignore", "ignore", "ignore"],
         timeout: 5000,
       });
@@ -126,6 +189,27 @@ async function sendNotification(
   }
 
   if (platform === "windows") {
+    // Windows Terminal: native toast (better than a blocking MessageBox)
+    if (process.env.WT_SESSION) {
+      try {
+        const escapedTitle = title.replace(/'/g, "''");
+        const escapedBody = body.replace(/'/g, "''");
+        const toastScript = [
+          `$t=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]`,
+          `$x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText01)`,
+          `$x.GetElementsByTagName('text')[0].AppendChild($x.CreateTextNode('${escapedBody}'))>$null`,
+          `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${escapedTitle}').Show([Windows.UI.Notifications.ToastNotification]::new($x))`,
+        ].join("; ");
+        await execAsync(
+          "powershell.exe",
+          ["-NoProfile", "-Command", toastScript],
+          { stdio: ["ignore", "ignore", "ignore"], timeout: 5000 },
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    }
     try {
       const escapedTitle = title.replace(/'/g, "''");
       const escapedBody = body.replace(/'/g, "''");
@@ -154,7 +238,9 @@ interface NotifyConfig {
   tui: boolean;
   onTurnEnd: boolean;
   onAgentSettled: boolean;
-  quietAfterMinutes: number; // don't notify again within this window
+  quietAfterMinutes: number; // don't notify again within this window (dedup=quiet)
+  terminal: "auto" | "off"; // terminal escape fallback when OS-native didn't deliver
+  dedup: "quiet" | "run"; // quiet window, or one notification per agent run
 }
 
 const DEFAULT_CONFIG: NotifyConfig = {
@@ -165,12 +251,16 @@ const DEFAULT_CONFIG: NotifyConfig = {
   onTurnEnd: false, // too noisy, default off
   onAgentSettled: true, // best default
   quietAfterMinutes: 2,
+  terminal: "auto",
+  dedup: "quiet",
 };
 
 let lastNotifyTime = 0;
+let notifiedThisRun = false;
 
 function shouldNotify(config: NotifyConfig): boolean {
   if (!config.enabled) return false;
+  if (config.dedup === "run") return !notifiedThisRun;
   const now = Date.now();
   const quietMs = config.quietAfterMinutes * 60 * 1000;
   if (now - lastNotifyTime < quietMs) return false;
@@ -179,6 +269,7 @@ function shouldNotify(config: NotifyConfig): boolean {
 
 function markNotified() {
   lastNotifyTime = Date.now();
+  notifiedThisRun = true;
 }
 
 async function notify(
@@ -195,8 +286,16 @@ async function notify(
     tasks.push(playSound().then(() => true).catch(() => false));
   }
 
+  // OS-native desktop notification first
+  let osDelivered = false;
   if (config.desktop) {
-    tasks.push(sendNotification(title, body).catch(() => false));
+    osDelivered = await sendNotification(title, body).catch(() => false);
+  }
+
+  // Terminal escape fallback (headless/SSH, missing daemon, ...)
+  let terminalDelivered = false;
+  if (config.terminal === "auto" && !osDelivered) {
+    terminalDelivered = notifyTerminal(title, body);
   }
 
   let tuiDelivered = false;
@@ -206,8 +305,8 @@ async function notify(
   }
 
   const results = await Promise.all(tasks);
-  const delivered = tuiDelivered || results.some(Boolean);
-  // Only consume the quiet window when something actually went out
+  const delivered = tuiDelivered || osDelivered || terminalDelivered || results.some(Boolean);
+  // Only consume the dedup slot when something actually went out
   if (delivered) markNotified();
   return delivered;
 }
@@ -227,7 +326,14 @@ export default function (pi: ExtensionAPI) {
       process.env.PI_NOTIFY_QUIET_MINUTES ?? "2",
       10,
     ) || 2,
+    terminal: process.env.PI_NOTIFY_TERMINAL === "off" ? "off" : "auto",
+    dedup: process.env.PI_NOTIFY_DEDUP === "run" ? "run" : "quiet",
   };
+
+  // Reset the once-per-run dedup flag whenever a new agent run begins
+  pi.on("agent_start", () => {
+    notifiedThisRun = false;
+  });
 
   // --- Agent settled: agent is fully done, waiting for user ---
   if (config.onAgentSettled) {
@@ -236,7 +342,7 @@ export default function (pi: ExtensionAPI) {
         ctx,
         config,
         "Pi Ready",
-        "Agent finished — your input is needed",
+        "Agent finished вЂ” your input is needed",
       );
     });
   }
@@ -247,53 +353,4 @@ export default function (pi: ExtensionAPI) {
       await notify(ctx, config, "Pi Turn Done", "Agent turn completed");
     });
   }
-
-  // --- Register a manual tool for on-demand notifications ---
-  pi.registerTool({
-    name: "notify",
-    label: "Notify",
-    description:
-      "Send a desktop notification with optional sound. " +
-      "Use to alert the user when long tasks complete or when their attention is needed.",
-    promptSnippet: "Send desktop notification with optional sound",
-    promptGuidelines: [
-      "Use notify to alert the user when long-running tasks complete.",
-      "Use notify when the user explicitly asks for a notification.",
-    ],
-    parameters: Type.Object({
-      title: Type.String({
-        description: "Notification title",
-      }),
-      message: Type.String({
-        description: "Notification body text",
-      }),
-      sound: Type.Optional(
-        Type.Boolean({
-          description: "Play a sound (default: true)",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const adHocConfig: NotifyConfig = {
-        ...config,
-        sound: params.sound !== false,
-        enabled: true, // always allow manual notify
-        quietAfterMinutes: 0, // manual notifications bypass the quiet window
-      };
-
-      const delivered = await notify(ctx, adHocConfig, params.title, params.message);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: delivered
-              ? `Notification sent: ${params.title}`
-              : `Notification not delivered (desktop and sound backends unavailable): ${params.title}`,
-          },
-        ],
-        details: { title: params.title, message: params.message, delivered },
-      };
-    },
-  });
 }
