@@ -1,15 +1,15 @@
 /**
- * Notify extension вЂ” desktop notifications + sound when the agent needs your input.
+ * Notify extension -- desktop notifications + sound when the agent needs your input.
  *
  * Hooks into pi's lifecycle events to send OS-level notifications:
- *   - turn_end       в†’ notification when the agent finishes a turn
- *   - agent_settled  в†’ notification when the agent is fully done
+ *   - turn_end       -> notification when the agent finishes a turn
+ *   - agent_settled  -> notification when the agent is fully done
  *
  * Delivery channels (OS-native first, terminal fallback when unavailable):
- *   Linux   вЂ” notify-send (libnotify, only when DESKTOP_SESSION is set) + paplay / canberra-gtk-play
- *   macOS   вЂ” osascript (Notification Center) + afplay
- *   Windows вЂ” Windows Terminal toast (WT_SESSION) or PowerShell MessageBox + SystemSounds
- *   Terminal вЂ” OSC 99 (kitty) / OSC 777 (kitty format, e.g. Ghostty) escape sequences,
+ *   Linux   -- notify-send (libnotify, only when DESKTOP_SESSION is set) + paplay / canberra-gtk-play
+ *   macOS   -- osascript (Notification Center) + afplay
+ *   Windows -- Windows Terminal toast (WT_SESSION) or PowerShell MessageBox + SystemSounds
+ *   Terminal -- OSC 99 (kitty) / OSC 777 (kitty format, e.g. Ghostty) escape sequences,
  *              used when the OS channel is unavailable or fails (headless/SSH setups)
  *
  * Env config:
@@ -18,8 +18,8 @@
  *   PI_NOTIFY_QUIET_MINUTES=2, PI_NOTIFY_TERMINAL=auto|off, PI_NOTIFY_DEDUP=quiet|run
  *
  * Dedup modes (PI_NOTIFY_DEDUP):
- *   quiet (default) вЂ” at most one notification per quiet window
- *   run             вЂ” at most one notification per agent run (reset on agent_start)
+ *   quiet (default) -- at most one notification per quiet window
+ *   run             -- at most one notification per agent run (reset on agent_start)
  */
 
 import { execFile } from "node:child_process";
@@ -120,7 +120,7 @@ function writeRawToTerminal(data: Buffer): boolean {
 }
 
 function notifyOSC777(title: string, body: string): boolean {
-  // kitty-format notification вЂ” supported by kitty and Ghostty
+  // kitty-format notification -- supported by kitty and Ghostty
   return writeRawToTerminal(Buffer.from(`\x1b]777;notify;${title};${body}\x07`));
 }
 
@@ -165,11 +165,11 @@ async function sendNotification(
   }
 
   if (platform === "linux") {
-    // No desktop session (headless/SSH) вЂ” let the caller fall back to the
+    // No desktop session (headless/SSH) -- let the caller fall back to the
     // terminal instead of handing the notification to a daemon nobody sees.
     if (!process.env.DESKTOP_SESSION) return false;
     try {
-      // execFile passes argv directly (no shell) вЂ” no escaping needed.
+      // execFile passes argv directly (no shell) -- no escaping needed.
       // -a groups it under the "Pi" app, the sound hint lets the DE play a
       // notification sound even without paplay/canberra available.
       await execAsync("notify-send", [
@@ -342,7 +342,7 @@ export default function (pi: ExtensionAPI) {
         ctx,
         config,
         "Pi Ready",
-        "Agent finished вЂ” your input is needed",
+        "Agent finished -- your input is needed",
       );
     });
   }
