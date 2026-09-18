@@ -438,6 +438,7 @@ function parseBing(html: string, count: number): SearchResult[] {
 		const link = chunk.match(/<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
 		if (!link) continue;
 		let url = decodeEntities(link[1]);
+		if (url.startsWith("//")) url = `https:${url}`;
 		// Bing wraps result URLs in a /ck/a redirect; the real URL is base64 in u=a1...
 		const u = url.match(/[?&]u=a1([A-Za-z0-9+/=_-]+)/);
 		if (u) {
@@ -825,7 +826,7 @@ class SearchResultsOverlay {
  * caught). It is a guardrail against accidental or model-driven probing, not
  * a security boundary. Throws a clean tool error for blocked URLs.
  */
-function assertPublicUrl(url: string): void {
+export function assertPublicUrl(url: string): void {
 	const block: () => never = () => {
 		throw new Error(`blocked non-public URL: ${url}`);
 	};
@@ -841,24 +842,39 @@ function assertPublicUrl(url: string): void {
 
 	if (host === "localhost" || host.endsWith(".local")) block();
 
+	// IPv4: 127.*, 0.*, 10.*, 169.254.*, 172.16.*-172.31.*, 192.168.*
+	const blockPrivateV4 = (a: number, b: number): void => {
+		if (a === 127 || a === 0 || a === 10) block();
+		if (a === 169 && b === 254) block();
+		if (a === 172 && b >= 16 && b <= 31) block();
+		if (a === 192 && b === 168) block();
+	};
+
 	if (host.includes(":")) {
 		// IPv6: ::1, fc00::/7 (unique-local), fe80::/10 (link-local)
 		if (host === "::1") block();
 		if (/^f[cd]/.test(host)) block();
 		if (/^fe[89ab]/.test(host)) block();
+		// IPv4-mapped IPv6 (::ffff:a.b.c.d or ::ffff:h1h2:h3h4): the mapped
+		// 32 bits get the same IPv4 rules, otherwise loopback/private
+		// addresses slip through in mapped notation.
+		const mapped = host.match(/^::ffff:(.+)$/);
+		if (mapped) {
+			const dotted = mapped[1].match(/^(\d{1,3})\.(\d{1,3})\./);
+			const hex = mapped[1].match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+			if (dotted) {
+				blockPrivateV4(Number(dotted[1]), Number(dotted[2]));
+			} else if (hex) {
+				// The first 16-bit group holds octets 1-2 (high byte = octet 1).
+				const hi = parseInt(hex[1]!, 16);
+				blockPrivateV4((hi >> 8) & 0xff, hi & 0xff);
+			}
+		}
 		return;
 	}
 
-	// IPv4: 127.*, 0.*, 10.*, 169.254.*, 172.16.*-172.31.*, 192.168.*
 	const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-	if (m) {
-		const a = Number(m[1]);
-		const b = Number(m[2]);
-		if (a === 127 || a === 0 || a === 10) block();
-		if (a === 169 && b === 254) block();
-		if (a === 172 && b >= 16 && b <= 31) block();
-		if (a === 192 && b === 168) block();
-	}
+	if (m) blockPrivateV4(Number(m[1]), Number(m[2]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,12 +1107,15 @@ async function apiSearch(
 	if (params.lang) payload.lang = params.lang;
 	if (params.country) payload.country = params.country;
 	if (params.filter) payload.filter = params.filter;
-	const result = await firecrawlFetch<{ success: boolean; error?: string; data: ApiSearchItem[] }>(
+	const result = await firecrawlFetch<{ success: boolean; error?: string; data: ApiSearchItem[] | null }>(
 		"/v1/search",
 		payload,
 		signal,
 	);
-	return (result.data ?? []).map((item) => ({
+	if (!Array.isArray(result.data)) {
+		throw new ApiError("malformed response (missing data)", "other");
+	}
+	return result.data.map((item) => ({
 		title: item.title || "No title",
 		url: item.url,
 		snippet: item.description ? item.description.slice(0, 300) : undefined,
@@ -1652,9 +1671,8 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { expanded }, theme) {
-			if (result.details?.error) {
-				return new Text(theme.fg("error", "Extraction failed"), 0, 0);
-			}
+			// Errors are thrown (not returned as details.error), so pi's
+			// standard error rendering applies; no error branch here.
 			const details = result.details as WebExtractDetails | undefined;
 			let text =
 				details?.backend === "local"
@@ -1680,7 +1698,13 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			}
 			if (!ctx.hasUI) return;
 
-			const result = await runUnifiedSearch(query, { engine: "auto", count: 5 }, undefined, (...a) => pi.exec(...a));
+			let result: UnifiedSearchResult;
+			try {
+				result = await runUnifiedSearch(query, { query, engine: "auto", count: 5 }, undefined, (...a) => pi.exec(...a));
+			} catch (e) {
+				ctx.ui.notify((e as Error).message, "error");
+				return;
+			}
 			const token = result.backend === "api" ? "api" : (result.engine ?? "?");
 
 			if (ctx.mode === "tui") {

@@ -264,8 +264,8 @@ Detected in this order:
 4. Malformed JSON body -> reason `malformed response`
 5. `success === false` -> reason from the response's `error` field, or
  `api reported failure`
-6. `success === true` but `data` missing or null (search) -> reason
- `malformed response (missing data)`
+6. `success === true` but `data` missing, null, or (search) not an array
+ -> reason `malformed response (missing data)`
 7. Invalid `freshness`/`tbs` input -> validated BEFORE any api call, and only
  when the api backend will be used (apiAvailable, or backend "api"); throw
  immediately with no fallback (input error, not backend failure). Reuse
@@ -382,7 +382,9 @@ fetch`). User-Agent: the first Chrome UA from Appendix A's USER_AGENTS.
   truncated? }`.
 - renderCall/renderResult: reuse Appendix B's renderers; the collapsed
   success line reads `checked via local fetch` (vs Appendix B's
-  `checked`), error states as in Appendix B.
+  `checked`). Error states: the unified extension throws (pi's standard
+  error rendering applies), so Appendix B's `details.error` branch is
+  dropped as unreachable.
 
 ## 7. Local scraper backend (detailed technique)
 
@@ -569,7 +571,7 @@ itself (`coverageWarning`):
     search: { backend: "api" | "local", engine?: EngineName, query,
               results, failures?, stage? }
     extract: { url, title?, format, backend: "api" | "local", linkCount?,
-               statusCode?, truncated?, error? }
+               statusCode?, truncated? }
 - web_extract output: Appendix B's assembly (Title line, truncateHead
   content, links section) plus the 6.3 additions for the local backend.
 
@@ -578,10 +580,11 @@ itself (`coverageWarning`):
 - `assertPublicUrl` guard on EVERY url that will be fetched: the api path's
   `url` parameter AND the degraded plain fetch. Deny: host `localhost` or
   ending in `.local`; IPs `127.*`, `0.*`, `10.*`, `169.254.*`, `172.16.*`
-  through `172.31.*`, `192.168.*`, `::1`, `fc00::/7`, `fe80::/10`. Appendix B
-  currently has NO guard -- this is a new function in the unified file, and
-  the guard error must be a clean tool error (e.g. `blocked non-public URL:
-  <url>`), not a crash.
+  through `172.31.*`, `192.168.*`, `::1`, `fc00::/7`, `fe80::/10`, plus the
+  IPv4-mapped IPv6 forms of the denied IPv4 ranges (`::ffff:127.0.0.1`,
+  `::ffff:7f00:1`, ...). Appendix B currently has NO guard -- this is a new
+  function in the unified file, and the guard error must be a clean tool
+  error (e.g. `blocked non-public URL: <url>`), not a crash.
 - Redirect re-validation on the plain fetch: every redirect target must pass
   assertPublicUrl (6.3).
 - The guard is string-based (no DNS resolution): a public hostname that
