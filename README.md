@@ -36,22 +36,53 @@ clone, then push.
 > the remote when the remote has moved, wiping uncommitted edits. Run
 > `/sync-up` first if you have unsaved changes.
 
-## Firecrawl
+## Web Search & Extract
 
-`web_search` / `web_extract` talk to a self-hosted [Firecrawl](https://github.com/firecrawl/firecrawl)
-instance. Configure per device with `PI_FIRECRAWL_URL`:
+`web_search` / `web_extract` are provided by a single extension
+(`extensions/web-search.ts`) with **api-first, local-fallback** routing:
 
-| Value | Behavior |
+- **api backend** — a self-hosted [Firecrawl](https://github.com/firecrawl/firecrawl)
+  instance. `web_search` calls `/v1/search`; `web_extract` calls `/v1/scrape`
+  (renders JavaScript).
+- **local backend** — no instance needed. `web_search` runs a local search
+  engine chain (brave → google → duckduckgo → bing) built for restrictive
+  firewalls; `web_extract` does a plain-HTTP fetch (no JS rendering, clearly
+  labeled).
+
+The `backend` parameter selects the routing: `auto` (default) uses the api
+when it is configured and healthy, falling back to local when the api is
+unavailable, fails, or returns nothing; `api` forces the api (errors instead
+of falling back); `local` forces the local path.
+
+### Configuration
+
+| Var | Meaning |
 |---|---|
-| unset | defaults to `http://localhost:3002` |
-| a URL | uses that instance, e.g. `https://fc.example.com` |
-| `off` or empty | disables both tools entirely |
+| `PI_FIRECRAWL_URL` | Origin (scheme + host + port) of the instance, e.g. `http://firecrawl.internal:3002`. Do **not** include `/v1` — the client appends it. Unset or empty → api backend disabled (local paths only). Trailing slashes are trimmed. |
+| `PI_FIRECRAWL_DISABLE` | Value `true` forces the api backend off even when `PI_FIRECRAWL_URL` is set. Any other value, or unset, has no effect. |
+| `WEB_SEARCH_ENGINES` | Comma-separated local chain (subset/reordering of `brave,google,duckduckgo,bing`). |
 
-Set it in your shell profile (e.g. `~/.bashrc`), or disable per device with
-`pi config` (package resource filtering).
+Set these in your shell profile (e.g. `~/.bashrc`). The deployment target is a
+**keyless** instance on a trusted internal network — the client sends no
+Authorization header (the old `PI_FIRECRAWL_API_KEY` is removed).
 
-If the instance requires an API key, set `PI_FIRECRAWL_API_KEY` — it is
-sent as a Bearer token on every request.
+### Security & privacy
+
+- Every URL that will be fetched (the api `url` parameter **and** the local
+  plain fetch, including every redirect target) passes an `assertPublicUrl`
+  guard that denies `localhost`/`*.local` and private/loopback IPs
+  (`127.*`, `0.*`, `10.*`, `169.254.*`, `172.16.*`–`172.31.*`, `192.168.*`,
+  `::1`, `fc00::/7`, `fe80::/10`). A blocked URL is a clean tool error, not a
+  crash. The guard is **string-based** (no DNS resolution): a public hostname
+  that resolves to an internal IP is *not* caught — it is a guardrail against
+  accidental or model-driven probing, not a security boundary.
+- Consequence: the local fetch (and the api, for scrape targets) cannot reach
+  private/loopback URLs. On an internal network, internal-page extraction
+  needs the api backend pointed at a reachable instance.
+- **Privacy:** the api path sends the query (search) and the target URL plus
+  page content (extract) to the Firecrawl instance. On a trusted-network
+  deployment that is the point; `PI_FIRECRAWL_DISABLE` and
+  `backend: "local"` are the opt-outs.
 
 ## Per-device files (not synced)
 
@@ -70,7 +101,7 @@ The `.gitignore` guards against committing them by accident.
 
 - `extensions/`
   - `clipboard.ts` — `clipboard_read` / `clipboard_write` tools
-  - `firecrawl.ts` — `web_search` / `web_extract` tools (self-hosted Firecrawl)
+  - `web-search.ts` — `web_search` / `web_extract` tools (Firecrawl api with local fallback) + `/websearch` command
   - `notify.ts` — desktop notifications on agent events
   - `subagent.ts` — delegate tasks to subagents (single / parallel / chain)
   - `subprocess.ts` — run subprocesses sync/async with status checks
