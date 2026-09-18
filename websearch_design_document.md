@@ -132,10 +132,10 @@ TypeBox schema:
 			}),
 		),
 		freshness: Type.Optional(
-			Type.String({ description: "api backend only: time filter, e.g. 'day', 'week', 'month', 'year', '7d', '30d', or a raw tbs value like 'qdr:w'. Best-effort: the api backend applies it only where its search engines support time filtering (a note is appended to the results). Ignored by the local backend." }),
+			Type.String({ description: "api backend only: time filter, e.g. 'day', 'week', 'month', 'year', '7d', '30d', or a raw tbs value like 'qdr:w'. Best-effort: most of the api's search engines apply it, but not all (a note is appended to the results). Ignored by the local backend." }),
 		),
 		tbs: Type.Optional(
-			Type.String({ description: "api backend only: raw Google time-based search string (e.g. 'qdr:w'). Takes precedence over freshness. Best-effort: the api backend applies it only where its search engines support time filtering (a note is appended to the results). Ignored by the local backend." }),
+			Type.String({ description: "api backend only: raw Google time-based search string (e.g. 'qdr:w'). Takes precedence over freshness. Best-effort: most of the api's search engines apply it, but not all (a note is appended to the results). Ignored by the local backend." }),
 		),
 		lang: Type.Optional(
 			Type.String({ description: "api backend only: language code (e.g. 'en', 'zh', 'ja'). Ignored by the local backend." }),
@@ -164,8 +164,20 @@ Notes:
   guarantee. To keep the agent from treating "fresh" as verified, when
   `tbs`/`freshness` is set AND the results came from the api backend, a note
   is appended to the results (section 9): `(time filter "<tbs>" is
-  best-effort: the api backend applies it only where its search engines
-  support it - verify recency before relying on it)`.
+  best-effort: most of the api's search engines apply it, but not all -
+  verify recency before relying on it)`.
+  - Per-engine reality (verified 2026-09-19 against
+    `searxng/searxng:latest`, effective config = image defaults +
+    `/home/lw/llms/search/searxng/settings.yml`): of the 7 active
+    general-category engines, **6 apply the time filter** — google, google
+    cse, yahoo, mojeek, swisscows (module-level `time_range_support = True`)
+    and brave (instance-level `time_range_support: true` in the image's
+    default settings; the module default is `False`, time-range only for
+    `brave_category: search`/goggles, which is the active instance).
+    **wikipedia does not** (no `time_range_support` in its module). The
+    note says "most ... but not all" — accurate for this deployment; if the
+    engine curation changes (re-checked on SearXNG image bumps), re-verify
+    and adjust the wording if the majority flips.
 - `engine` constrains the local chain; useful with `backend: "local"`, or as
   the fallback half of `auto`.
 
