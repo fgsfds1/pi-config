@@ -132,10 +132,10 @@ TypeBox schema:
 			}),
 		),
 		freshness: Type.Optional(
-			Type.String({ description: "api backend only: time filter, e.g. 'day', 'week', 'month', 'year', '7d', '30d', or a raw tbs value like 'qdr:w'. Ignored by the local backend." }),
+			Type.String({ description: "api backend only: time filter, e.g. 'day', 'week', 'month', 'year', '7d', '30d', or a raw tbs value like 'qdr:w'. Best-effort: the api backend applies it only where its search engines support time filtering (a note is appended to the results). Ignored by the local backend." }),
 		),
 		tbs: Type.Optional(
-			Type.String({ description: "api backend only: raw Google time-based search string (e.g. 'qdr:w'). Takes precedence over freshness. Ignored by the local backend." }),
+			Type.String({ description: "api backend only: raw Google time-based search string (e.g. 'qdr:w'). Takes precedence over freshness. Best-effort: the api backend applies it only where its search engines support time filtering (a note is appended to the results). Ignored by the local backend." }),
 		),
 		lang: Type.Optional(
 			Type.String({ description: "api backend only: language code (e.g. 'en', 'zh', 'ja'). Ignored by the local backend." }),
@@ -156,6 +156,16 @@ Notes:
   applied only by the api backend; the local backend silently ignores them
   (documented in the description; the model should not expect them to work
   locally).
+- `tbs`/`freshness` are BEST-EFFORT even on the api backend: the Firecrawl
+  search backend only applies a time filter where its underlying search
+  engines support one (SearXNG maps the mappable values to
+  `time_range=day|week|month|year`; values without an equivalent such as
+  `qdr:7d` are dropped). So a "fresh" result set is a request, not a
+  guarantee. To keep the agent from treating "fresh" as verified, when
+  `tbs`/`freshness` is set AND the results came from the api backend, a note
+  is appended to the results (section 9): `(time filter "<tbs>" is
+  best-effort: the api backend applies it only where its search engines
+  support it - verify recency before relying on it)`.
 - `engine` constrains the local chain; useful with `backend: "local"`, or as
   the fallback half of `auto`.
 
@@ -555,9 +565,13 @@ itself (`coverageWarning`):
        ...
     (optional single-host note)
     (optional coverage warnings)
+    (optional tbs best-effort note, api results only)
 
   where `<token>` is the engine name (brave/google/duckduckgo/bing) for the
-  local path -- exactly as today -- and `api` for the api path.
+  local path -- exactly as today -- and `api` for the api path. The tbs note
+  is appended (after the coverage warnings) only when `tbs`/`freshness` was
+  set AND the results came from the api backend; it never appears on local
+  results (the local chain ignores tbs by contract).
 - Empty-result lines (provenance is always explicit):
     local, api not involved:     No results found for "<query>".
     backend "api", clean empty:  No results found for "<query>". (api backend)

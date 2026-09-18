@@ -751,7 +751,7 @@ function hostOf(url: string): string {
 	}
 }
 
-export function formatResults(query: string, engine: EngineName | "api", results: SearchResult[]): string {
+export function formatResults(query: string, engine: EngineName | "api", results: SearchResult[], tbs?: string): string {
 	const lines: string[] = [`Web search results for "${query}" (via ${engine}, ${results.length}):`, ""];
 	results.forEach((r, i) => {
 		lines.push(`${i + 1}. ${r.title}`);
@@ -764,6 +764,14 @@ export function formatResults(query: string, engine: EngineName | "api", results
 		lines.push(`(note: all results come from a single host (${[...hosts][0]}) - treat with caution)`);
 	}
 	lines.push(...coverageWarning(query, results));
+	if (engine === "api" && tbs) {
+		// The api backend applies time filters only where its search engines
+		// support them (and not at all for values without an equivalent, e.g.
+		// qdr:7d) — so "fresh" is a request, not a guarantee.
+		lines.push(
+			`(time filter "${tbs}" is best-effort: the api backend applies it only where its search engines support it - verify recency before relying on it)`,
+		);
+	}
 	return lines.join("\n").trimEnd();
 }
 
@@ -1435,13 +1443,13 @@ const webSearchSchema = Type.Object({
 	freshness: Type.Optional(
 		Type.String({
 			description:
-				"api backend only: time filter, e.g. 'day', 'week', 'month', 'year', '7d', '30d', or a raw tbs value like 'qdr:w'. Ignored by the local backend.",
+				"api backend only: time filter, e.g. 'day', 'week', 'month', 'year', '7d', '30d', or a raw tbs value like 'qdr:w'. Best-effort: the api backend applies it only where its search engines support time filtering (a note is appended to the results). Ignored by the local backend.",
 		}),
 	),
 	tbs: Type.Optional(
 		Type.String({
 			description:
-				"api backend only: raw Google time-based search string (e.g. 'qdr:w'). Takes precedence over freshness. Ignored by the local backend.",
+				"api backend only: raw Google time-based search string (e.g. 'qdr:w'). Takes precedence over freshness. Best-effort: the api backend applies it only where its search engines support time filtering (a note is appended to the results). Ignored by the local backend.",
 		}),
 	),
 	lang: Type.Optional(
@@ -1550,7 +1558,12 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 
 			if (result.results.length > 0) {
 				const token: EngineName | "api" = result.backend === "api" ? "api" : (result.engine as EngineName);
-				const formatted = formatResults(query, token, result.results);
+				// tbs note only for api results (the local chain ignores tbs by
+				// contract). If the result came from the api, resolveTbs already
+				// succeeded inside runUnifiedSearch with the same params, so this
+				// cannot throw.
+				const tbs = result.backend === "api" ? resolveTbs(params.tbs, params.freshness) : undefined;
+				const formatted = formatResults(query, token, result.results, tbs);
 				const text = result.annotation ? `${result.annotation}\n${formatted}` : formatted;
 				return {
 					content: [{ type: "text", text }],
