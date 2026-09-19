@@ -280,7 +280,7 @@ Detected in this order:
 
 1. Network error / connection refused / DNS failure -> reason
  `unreachable (<message>)`
-2. Timeout (60s) -> reason `timed out after 60s`
+2. Timeout (70s) -> reason `timed out after 70s`
 3. HTTP status not 2xx -> reason `HTTP <status>`
  (401/403 and 429 are handled by the breaker, 5.3)
 4. Malformed JSON body -> reason `malformed response`
@@ -356,8 +356,9 @@ wait_seconds * 1000 when > 0; includeTags = [selector]), response envelope
 
 Additions over Appendix B:
 
-- 60s timeout on the fetch (Appendix B has none; a hanging instance must not
- hang the tool).
+- 70s timeout on the fetch (Appendix B has none; a hanging instance must not
+ hang the tool). Kept above the self-hosted v1 scrape deadline (45 s) so the
+ api's own 408 reaches the router before this ceiling does.
 - Envelope validation per 5.2 items 4-6 (scrape's item 6 is
  `success === true` but `!data` -> `malformed response (missing data)`).
 - NO Authorization header (keyless; section 3).
@@ -545,7 +546,7 @@ itself (`coverageWarning`):
   unset-default of `http://localhost:3002` is removed (section 3).
 - POST, JSON body, header `Content-Type: application/json`. NO Authorization
   header (keyless deployment; section 3).
-- 60s timeout (new; Appendix B had none).
+- 70s timeout (new; Appendix B had none).
 - Response envelope: `{ success: boolean, error?: string, data?: ... }`.
   search data: array of `{ url, title, description }` (description may be
   an empty string).
@@ -641,7 +642,7 @@ File: `extensions/web-search.ts`, Tab-indented. Layout:
    @earendil-works/pi-ai; matchesKey, Text, visibleWidth from
    @earendil-works/pi-tui; Type from typebox).
 3. Config + availability + breaker (NEW; sections 3, 5.3).
-4. Api client (FROM Appendix B, modified): `firecrawlFetch` with a 60s
+4. Api client (FROM Appendix B, modified): `firecrawlFetch` with a 70s
    timeout, no auth header, and error throwing that carries the 5.2 reason
    string (so the router can classify failures by inspecting the thrown
    error); `freshnessToTbs` VERBATIM; NEW: a small `classifyApiError` that
@@ -706,7 +707,7 @@ Search (mock /v1/search):
 - S6  401 -> fallback; the breaker trips for the session: subsequent calls in
   the same pi process skip the api even if the mock now returns 200.
 - S7  429 -> fallback + 10-minute cooldown (same hit-counter check as S5).
-- S8  mock sleeps 70s -> the tool times out at 60s and falls back; it must
+- S8  mock sleeps 75s -> the tool times out at 70s and falls back; it must
   not hang.
 - S9  backend:"api" + mock 500 -> tool error (red), with NO local results in
   the output.
@@ -806,7 +807,7 @@ Both machines:
   the deployment changes.
 - web_map / LLM-based structured-extract endpoints are out of scope; the
   two-tool surface is deliberate.
-- The 10-minute cooldown and the 60s/20s timeouts are hardcoded; promote to
+- The 10-minute cooldown and the 70s/20s timeouts are hardcoded; promote to
   env vars only if they ever need tuning.
 - Single file; if it grows past ~1500 lines, split into an
   extensions/web-search/ directory with index.ts (requires adding

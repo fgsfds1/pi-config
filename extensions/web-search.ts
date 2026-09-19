@@ -149,7 +149,11 @@ function apiAvailable(): boolean {
 // Api client (self-hosted Firecrawl)
 // ---------------------------------------------------------------------------
 
-const API_TIMEOUT_MS = 60_000;
+// 70 s: must stay above the self-hosted v1 scrape deadline (45 s after the
+// fork's timeout prefault bump) so the api's own 408 fires first and the
+// local fallback path is driven by a definitive api answer, not by this
+// ceiling. See REPORT-408-fixes.md §7/§9.
+const API_TIMEOUT_MS = 70_000;
 
 /** An api failure carrying its reason string (section 5.2) and breaker kind. */
 class ApiError extends Error {
@@ -231,7 +235,7 @@ async function firecrawlFetch<T>(
 		});
 	} catch (err) {
 		if (signal?.aborted) throw err;
-		if (t.signal.aborted) throw new ApiError("timed out after 60s", "other");
+		if (t.signal.aborted) throw new ApiError("timed out after 70s", "other");
 		throw new ApiError(`unreachable (${(err as Error).message})`, "other");
 	} finally {
 		t.cancel();
