@@ -333,24 +333,36 @@ Reuse Appendix A's `onUpdate` partial mechanism, with stage strings:
 - `backend: "api"`: require apiAvailable (same error text as 5.1); run the api
 scrape; any failure or empty content -> throw (no fallback).
 - `backend: "auto"` with apiAvailable:
- - api scrape succeeds with content -> return it (6.2), no label.
- - api scrape fails (any 5.2 failure) -> breaker.note; run the plain fetch;
- if it yields content -> output = label line +
+ - api scrape (rung 1, normal browser UA) succeeds with clean content ->
+ return it (6.2), no label.
+ - api scrape fails (any 5.2 failure) -> breaker.note; run the plain fetch
+ (6.3, browser UA); if it yields content -> output = label line +
  `(api backend unavailable: <reason>)` + content.
  If the plain fetch also fails -> throw with both reasons.
- - api scrape succeeds but returns NO content (success, data present, no
-markdown/html/links) -> run the plain fetch as a second opinion:
-   - plain fetch has content -> label +
-    `(api backend returned no content - content from local fetch)` + content
-   - plain fetch also empty -> throw
-    `Extraction returned no content for <url> (api and local)`
+ - api scrape succeeds but the content is empty or looks challenged
+ (6.4) -> the plain-UA ladder:
+   - rung 2: api scrape with the plain UA (payload `headers:
+    {"user-agent": "pi-fetch/1.0"}` -- the api forwards `headers` to the
+    browser service, which uses a user-agent header there as the context
+    UA override). Clean content -> `[plain-UA api retry after
+    <challenge|no content>]` + content.
+   - rung 3 (auto only -- explicit api never falls back to local): the
+    plain fetch with the plain UA (6.3). Clean content ->
+    `[local fetch - no JS rendering - plain UA]` + content.
+   - no clean rung -> return the FIRST rung that produced any content +
+    `[challenge detected - retries did not improve]` (or `[no clean content
+    - retries did not improve]`); when no rung produced any content ->
+    throw `Extraction returned no content for <url> (api)` / `(api and
+    local)` as before.
 
 ### 6.2 Api scrape path
 
 Request/response shapes: EXACTLY as Appendix B --
-POST /v1/scrape, payload `{ url, formats, waitFor?, includeTags?, mobile? }`
-(formats = [format] plus "links" when include_links; waitFor =
-wait_seconds * 1000 when > 0; includeTags = [selector]), response envelope
+POST /v1/scrape, payload `{ url, formats, waitFor?, includeTags?, mobile?,
+headers? }` (formats = [format] plus "links" when include_links; waitFor =
+wait_seconds * 1000 when > 0; includeTags = [selector]; headers =
+`{"user-agent": PLAIN_USER_AGENT}` ONLY for the plain-UA rung, 6.4),
+response envelope
 `{ success, error?, data? { markdown?, html?, links?, metadata? } }`
 (metadata.statusCode is the upstream page status).
 
@@ -373,12 +385,20 @@ links, `... and N more` overflow) when links exist.
 - assertPublicUrl guard (section 10) FIRST. This path fetches directly from
  the user's machine, so the guard is mandatory here even though Appendix B
  lacks one.
-- http/https only. Single GET via global fetch, `redirect: "follow"` plus a
-redirect re-validation step: every redirect target must itself pass
-assertPublicUrl (global fetch follows blindly otherwise; this closes
-redirect-based SSRF).
+- http/https only. GET via global fetch, `redirect: "manual"` in a hop loop
+(max 10 hops): every redirect target must itself pass assertPublicUrl
+(global fetch would follow blindly otherwise; this closes redirect-based
+SSRF). Per-call cookie jar: every response's Set-Cookie values are stored
+(host-scoped, latest-wins per name+host) and sent back on subsequent hops --
+some sites gate content behind a redirect+Set-Cookie handshake (307 ->
+/?rr=1 + cookie) that cookieless clients loop on forever (undici's fetch
+has no cookie jar). Scope: this call only, no persistence.
 - 20s timeout. Body cap 2 MB (beyond -> error `page too large for local
-fetch`). User-Agent: the first Chrome UA from Appendix A's USER_AGENTS.
+fetch`). User-Agent: the first Chrome UA from Appendix A's USER_AGENTS, or
+PLAIN_USER_AGENT when the caller passes it (the ladder's plain-UA rung,
+6.4). Challenge-gated retry: when the first attempt (browser UA) comes back
+challenged (6.4), exactly one retry with PLAIN_USER_AGENT; best-result --
+keep the first attempt if the retry is still challenged or fails.
 - format `markdown` (default), the html-to-text pipeline:
   1. Remove `<script>`, `<style>`, `<noscript>`, `<template>`, `<head>`
      elements including their contents.
@@ -402,7 +422,29 @@ fetch`). User-Agent: the first Chrome UA from Appendix A's USER_AGENTS.
 - Output ordering: label line (`[local fetch - no JS rendering]`), optional
   auto-fallback annotation line (6.1), then the content per format.
 - Details shape: `{ url, title?, format, backend: "local", linkCount?,
-  truncated? }`.
+  statusCode, truncated? }` (the api path's details carry statusCode too).
+
+### 6.4 Challenge detection (the plain-UA ladder)
+
+Some WAFs apply a higher bar to browser UAs (JS/fingerprint checks) and let
+self-identifying bots through: Anubis's default policy challenges only UAs
+containing "Mozilla", and several measured CF/403 cases (danbooru,
+codeberg, gitlab.gnome, atwiki) passed with a plain UA. Detection gates the
+ladder; it never rejects content on its own.
+
+- `looksChallenged(statusCode, body)`: true when statusCode is in
+  {403, 406, 429, 498, 503} OR a marker appears in the first 3 KB of the
+  body (lowercased): `anubis`, `making sure you're not a bot`, `just a
+  moment`, `cf-chl`, `please enable cookies`, `fab_chlg`, `recaptcha`,
+  `проверк`, `доступ ограничен`. Deliberately conservative -- generic words
+  ("robot", "captcha") false-positive on real content. A wrong retry is
+  cheap (best-result logic keeps the first clean result); a wrong skip is
+  not.
+- `PLAIN_USER_AGENT = "pi-fetch/1.0"`: an honest non-browser UA. Tried only
+  after a challenge is detected on the normal attempt, so normal requests
+  are unaffected.
+- The ladder is plugin-driven and transparent to the model: the model sees
+  only the final result plus the winning rung's annotation.
 - renderCall/renderResult: reuse Appendix B's renderers; the collapsed
   success line reads `checked via local fetch` (vs Appendix B's
   `checked`). Error states: the unified extension throws (pi's standard

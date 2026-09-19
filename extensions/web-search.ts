@@ -274,6 +274,43 @@ const USER_AGENTS = [
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 ];
 
+/**
+ * Honest non-browser UA for the challenge-fallback lane. Many WAFs apply a
+ * higher bar to browser UAs (JS/fingerprint checks) and let self-identifying
+ * bots through: Anubis's default policy challenges only UAs containing
+ * "Mozilla", and several CF/403 cases (danbooru, codeberg, gitlab.gnome,
+ * atwiki) passed with a plain UA. Tried ONLY after a challenge is detected
+ * on the normal (Mozilla) attempt, so normal requests are unaffected.
+ */
+const PLAIN_USER_AGENT = "pi-fetch/1.0";
+
+/** Status codes that indicate a bot challenge / block page. */
+const CHALLENGE_STATUSES = new Set([403, 406, 429, 498, 503]);
+
+/**
+ * Challenge-page markers (lowercased, checked in the first 3 KB of the body).
+ * Deliberately conservative: generic words ("robot", "captcha") false-positive
+ * on real content. A wrong retry is cheap (best-result logic keeps the first
+ * clean result); a wrong skip is not.
+ */
+const CHALLENGE_MARKERS = [
+	"anubis",
+	"making sure you're not a bot",
+	"just a moment",
+	"cf-chl",
+	"please enable cookies",
+	"fab_chlg",
+	"recaptcha",
+	"проверк",
+	"доступ ограничен",
+];
+
+function looksChallenged(statusCode: number | undefined, body: string): boolean {
+	if (statusCode !== undefined && CHALLENGE_STATUSES.has(statusCode)) return true;
+	const head = body.slice(0, 3000).toLowerCase();
+	return CHALLENGE_MARKERS.some((m) => head.includes(m));
+}
+
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_ATTEMPTS = 3;
 
@@ -925,21 +962,46 @@ interface LocalExtractOutcome {
 async function localFetchPage(
 	url: string,
 	signal: AbortSignal | undefined,
+	opts?: { userAgent?: string },
 ): Promise<{ html: string; finalUrl: string; status: number }> {
 	assertPublicUrl(url);
 	let current = url;
+	const userAgent = opts?.userAgent ?? USER_AGENTS[0]!;
 	const t = withTimeout(signal, LOCAL_FETCH_TIMEOUT_MS);
+	// Minimal per-call cookie jar: some sites gate content behind a
+	// redirect+Set-Cookie handshake (307 -> /?rr=1 + cookie; cookieless
+	// clients loop forever). undici's fetch has no cookie jar, so follow the
+	// handshake manually. Scope: this call only, host-scoped, first-list-wins
+	// per name+host.
+	const jar: Array<{ name: string; value: string; host: string }> = [];
 	try {
 		for (let hop = 0; hop <= LOCAL_FETCH_MAX_REDIRECTS; hop++) {
+			const host = new URL(current).hostname;
+			const headers: Record<string, string> = {
+				"User-Agent": userAgent,
+				Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+			};
+			const forHost = jar.filter((c) => host === c.host || host.endsWith(`.${c.host}`));
+			if (forHost.length > 0) {
+				headers["Cookie"] = forHost.map((c) => `${c.name}=${c.value}`).join("; ");
+			}
 			const res = await fetch(current, {
-				headers: {
-					"User-Agent": USER_AGENTS[0]!,
-					Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-					"Accept-Language": "en-US,en;q=0.9",
-				},
+				headers,
 				redirect: "manual",
 				signal: t.signal,
 			});
+			const setCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+			for (const sc of setCookies) {
+				const pair = sc.split(";")[0] ?? "";
+				const eq = pair.indexOf("=");
+				if (eq <= 0) continue;
+				const name = pair.slice(0, eq).trim();
+				const value = pair.slice(eq + 1).trim();
+				const i = jar.findIndex((c) => c.name === name && c.host === host);
+				if (i >= 0) jar[i] = { name, value, host };
+				else jar.push({ name, value, host });
+			}
 			if (res.status >= 300 && res.status < 400) {
 				const loc = res.headers.get("location");
 				if (!loc) throw new Error(`redirect without Location header (HTTP ${res.status})`);
@@ -1029,8 +1091,23 @@ async function runLocalExtract(
 	url: string,
 	format: string,
 	signal: AbortSignal | undefined,
+	opts?: { userAgent?: string },
 ): Promise<LocalExtractOutcome> {
-	const { html, finalUrl, status } = await localFetchPage(url, signal);
+	const userAgent = opts?.userAgent ?? USER_AGENTS[0]!;
+	let { html, finalUrl, status } = await localFetchPage(url, signal, { userAgent });
+	// Challenge-gated plain-UA retry (see PLAIN_USER_AGENT): only when the
+	// first attempt used the browser UA. Best-result: keep the first attempt
+	// if the retry is still challenged or fails.
+	if (userAgent === USER_AGENTS[0]! && looksChallenged(status, html)) {
+		try {
+			const retry = await localFetchPage(url, signal, { userAgent: PLAIN_USER_AGENT });
+			if (!looksChallenged(retry.status, retry.html)) {
+				({ html, finalUrl, status } = retry);
+			}
+		} catch {
+			// keep the first attempt's result
+		}
+	}
 
 	if (format === "links") {
 		const links = extractLinks(html, finalUrl);
@@ -1152,11 +1229,17 @@ async function apiScrape(
 	format: string,
 	params: WebExtractToolInput,
 	signal: AbortSignal | undefined,
-): Promise<{ text: string; details: WebExtractDetails; hasContent: boolean }> {
+	userAgent?: string,
+): Promise<{ text: string; content: string; details: WebExtractDetails; hasContent: boolean }> {
 	const formats: string[] = [format];
 	if (params.include_links) formats.push("links");
 
 	const payload: Record<string, unknown> = { url, formats };
+	if (userAgent) {
+		// The api forwards `headers` to the browser service, which uses a
+		// user-agent header there as the context UA override.
+		payload.headers = { "user-agent": userAgent };
+	}
 	if (params.wait_seconds && params.wait_seconds > 0) {
 		payload.waitFor = params.wait_seconds * 1000;
 	}
@@ -1215,6 +1298,7 @@ async function apiScrape(
 
 	return {
 		text: parts.join("\n"),
+		content,
 		details: {
 			url,
 			title,
@@ -1379,8 +1463,8 @@ async function runUnifiedExtract(
 		};
 	}
 
-	// Api scrape.
-	let api: { text: string; details: WebExtractDetails; hasContent: boolean };
+	// Api scrape — rung 1 (normal browser UA).
+	let api: { text: string; content: string; details: WebExtractDetails; hasContent: boolean };
 	try {
 		api = await apiScrape(url, format, params, signal);
 	} catch (err) {
@@ -1400,25 +1484,64 @@ async function runUnifiedExtract(
 	}
 	breakerReset();
 
-	if (api.hasContent) {
+	if (api.hasContent && !looksChallenged(api.details.statusCode, api.content)) {
 		return { text: api.text, details: api.details };
 	}
+	const apiChallenged = looksChallenged(api.details.statusCode, api.content);
+	const reason = apiChallenged ? "challenge" : "no content";
+	// First rung that produced any content — returned if no rung comes back
+	// clean (a challenge page beats an error).
+	let fallback: { text: string; details: WebExtractDetails } | undefined;
+	if (api.hasContent) fallback = { text: api.text, details: api.details };
 
-	// Api succeeded but returned no content — second opinion from the plain
-	// fetch.
+	// Rung 2: plain-UA browser retry (detection-gated — only after a
+	// challenge or an empty result on the normal attempt).
+	if (useApi) {
+		try {
+			const r2 = await apiScrape(url, format, params, signal, PLAIN_USER_AGENT);
+			if (r2.hasContent) {
+				if (!looksChallenged(r2.details.statusCode, r2.content)) {
+					return {
+						text: `[plain-UA api retry after ${reason}]\n${r2.text}`,
+						details: r2.details,
+					};
+				}
+				fallback ??= { text: r2.text, details: r2.details };
+			}
+		} catch (err) {
+			if (signal?.aborted) throw err;
+			breakerNote(classifyApiError(err), apiReason(err));
+		}
+	}
+
+	// Rung 3: local fetch with the plain UA (auto mode only — explicit api
+	// never falls back to local).
+	if (backend !== "api") {
+		try {
+			const local = await runLocalExtract(url, format, signal, { userAgent: PLAIN_USER_AGENT });
+			if (local.hasContent) {
+				if (!looksChallenged(local.details.statusCode, local.text)) {
+					return {
+						text: `[local fetch - no JS rendering - plain UA]\n${local.text}`,
+						details: local.details,
+					};
+				}
+				fallback ??= { text: local.text, details: local.details };
+			}
+		} catch {
+			// The plain fetch failed — fall through to the fallback/error.
+		}
+	}
+
+	// No clean result — return the first rung that produced any content.
+	if (fallback) {
+		return {
+			text: `${fallback.text}\n[${apiChallenged ? "challenge detected" : "no clean content"} - retries did not improve]`,
+			details: fallback.details,
+		};
+	}
 	if (backend === "api") {
 		throw new Error(`Extraction returned no content for ${url} (api)`);
-	}
-	try {
-		const local = await runLocalExtract(url, format, signal);
-		if (local.hasContent) {
-			return {
-				text: `[local fetch - no JS rendering]\n(api backend returned no content - content from local fetch)\n${local.text}`,
-				details: local.details,
-			};
-		}
-	} catch {
-		// The plain fetch failed or was empty — fall through to the error.
 	}
 	throw new Error(`Extraction returned no content for ${url} (api and local)`);
 }
