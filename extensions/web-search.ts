@@ -934,7 +934,7 @@ interface WebExtractDetails {
 	url: string;
 	title?: string;
 	format: string;
-	backend: "api" | "local";
+	backend: "api" | "local" | "jina";
 	linkCount?: number;
 	statusCode?: number;
 	truncated?: boolean;
@@ -1155,6 +1155,52 @@ async function runLocalExtract(
 		details: { url, title, format, backend: "local", statusCode: status, truncated },
 		hasContent: body.trim().length > 0,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Jina Reader fallback (last rung of the web_extract ladder)
+// ---------------------------------------------------------------------------
+
+const JINA_READER_PREFIX = "https://r.jina.ai/";
+const JINA_TIMEOUT_MS = 25_000;
+
+/**
+ * Jina Reader (r.jina.ai) — a third-party scraping service that renders JS
+ * and clears bot challenges. Measured (REPORT-antibot.md step 3): it clears
+ * the CF-hard class (economist/producthunt/substack/ycombinator) in 1-2 s
+ * where the local browser is challenged. Used as the LAST rung (auto mode
+ * only, detection-gated): it sends the URL to a third party, so it is a
+ * fallback, not the default. An optional PI_JINA_KEY raises the rate limit
+ * (~20 RPM without a key, ~200 RPM with).
+ */
+async function jinaFetch(
+	url: string,
+	signal: AbortSignal | undefined,
+): Promise<{ text: string; title?: string; statusCode: number }> {
+	assertPublicUrl(url);
+	const t = withTimeout(signal, JINA_TIMEOUT_MS);
+	try {
+		const headers: Record<string, string> = { Accept: "text/plain" };
+		const key = process.env.PI_JINA_KEY;
+		if (key) headers["Authorization"] = `Bearer ${key}`;
+		const res = await fetch(JINA_READER_PREFIX + url, {
+			headers,
+			signal: t.signal,
+		});
+		if (!res.ok) throw new Error(`Jina Reader HTTP ${res.status}`);
+		const raw = await res.text();
+		// Jina returns a header (Title / URL Source / ... / Markdown Content:).
+		const titleMatch = raw.match(/^Title:\s*(.+)$/m);
+		const title = titleMatch ? cleanText(titleMatch[1]) : undefined;
+		const contentIdx = raw.indexOf("Markdown Content:");
+		const text =
+			contentIdx >= 0
+				? raw.slice(contentIdx + "Markdown Content:".length).trim()
+				: raw.trim();
+		return { text, title, statusCode: res.status };
+	} finally {
+		t.cancel();
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1579,31 @@ async function runUnifiedExtract(
 		}
 	}
 
+	// Rung 4: Jina Reader (auto mode only, markdown format, detection-gated).
+	// A third-party renderer that clears the CF-hard class the local browser
+	// can't (REPORT-antibot.md step 3). Last resort: it sends the URL to a
+	// third party, so only reached when every local rung was challenged/empty.
+	if (backend !== "api" && format === "markdown") {
+		try {
+			const jina = await jinaFetch(url, signal);
+			if (jina.text.trim().length > 0 && !looksChallenged(jina.statusCode, jina.text)) {
+				const title = jina.title ? `Title: ${jina.title}\n\n` : "";
+				return {
+					text: `[Jina Reader fallback after ${reason}]\n${title}${jina.text}`,
+					details: {
+						url,
+						title: jina.title,
+						format,
+						backend: "jina",
+						statusCode: jina.statusCode,
+					},
+				};
+			}
+		} catch {
+			// Jina failed (rate limit / network) — fall through to fallback/error.
+		}
+	}
+
 	// No clean result — return the first rung that produced any content.
 	if (fallback) {
 		return {
@@ -1817,7 +1888,9 @@ export default function webSearchExtension(pi: ExtensionAPI) {
 			let text =
 				details?.backend === "local"
 					? theme.fg("success", "✓ checked via local fetch")
-					: theme.fg("success", "✓ Extracted");
+					: details?.backend === "jina"
+						? theme.fg("success", "✓ via Jina Reader (third-party)")
+						: theme.fg("success", "✓ Extracted");
 			if (details?.title) {
 				text += ` ${theme.fg("dim", `— ${details.title}`)}`;
 			}
