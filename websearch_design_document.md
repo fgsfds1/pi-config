@@ -432,6 +432,16 @@ containing "Mozilla", and several measured CF/403 cases (danbooru,
 codeberg, gitlab.gnome, atwiki) passed with a plain UA. Detection gates the
 ladder; it never rejects content on its own.
 
+> **Service-side note (step ②, firecrawl fork `c5ea72b6d`):** the
+> self-hosted api's playwright service now ALSO handles challenges
+> internally, detection-gated (Anubis PoW solved in Node, plain-UA probe in
+> the same browser context, solver wait with a 5 s margin). So rung 1 (api,
+> browser UA) already absorbs most Anubis/UA-gated challenges before this
+> ladder ever runs; the ladder remains the backstop for what the service
+> leaves challenged (CF fingerprint / IP-reputation class) and for the local
+> path. Details: `REPORT-antibot.md` §12 and
+> `playwright-overlay/README.md` in the deployment dir.
+
 - `looksChallenged(statusCode, body)`: true when statusCode is in
   {403, 406, 429, 498, 503} OR a marker appears in the first 3 KB of the
   body (lowercased): `anubis`, `making sure you're not a bot`, `just a
