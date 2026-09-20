@@ -349,6 +349,11 @@ scrape; any failure or empty content -> throw (no fallback).
    - rung 3 (auto only -- explicit api never falls back to local): the
     plain fetch with the plain UA (6.3). Clean content ->
     `[local fetch - no JS rendering - plain UA]` + content.
+   - rung 4 (auto only, markdown format, 6.5): the Jina Reader fallback
+    (`https://r.jina.ai/<url>`). A third-party renderer that clears the
+    CF-hard class the local browser can't (REPORT-antibot.md step 3).
+    Clean content -> `[Jina Reader fallback after <challenge|no content>]`
+    + content. `backend: "jina"` in details.
    - no clean rung -> return the FIRST rung that produced any content +
     `[challenge detected - retries did not improve]` (or `[no clean content
     - retries did not improve]`); when no rung produced any content ->
@@ -457,9 +462,30 @@ ladder; it never rejects content on its own.
   only the final result plus the winning rung's annotation.
 - renderCall/renderResult: reuse Appendix B's renderers; the collapsed
   success line reads `checked via local fetch` (vs Appendix B's
-  `checked`). Error states: the unified extension throws (pi's standard
-  error rendering applies), so Appendix B's `details.error` branch is
-  dropped as unreachable.
+  `checked`); the Jina rung reads `via Jina Reader (third-party)`. Error
+  states: the unified extension throws (pi's standard error rendering
+  applies), so Appendix B's `details.error` branch is dropped as
+  unreachable.
+
+### 6.5 Jina Reader fallback (rung 4)
+
+The last rung of the `web_extract` ladder (auto mode, markdown format,
+detection-gated). `r.jina.ai` is a third-party scraping service that renders
+JS and clears bot challenges. Measured (REPORT-antibot.md step 3): it clears
+the CF-hard class (economist/producthunt/substack/ycombinator) in 1–2 s where
+the local browser is challenged. It is the last resort because it sends the
+URL to a third party (privacy), so it is only reached when every local rung
+(api browser-UA, api plain-UA, local plain-UA) was challenged or empty.
+
+- `jinaFetch(url, signal)`: GET `https://r.jina.ai/<url>` with
+  `Accept: text/plain` (+ `Authorization: Bearer $PI_JINA_KEY` when set).
+  25 s timeout. Parses the Jina header (`Title:` / `Markdown Content:`) and
+  returns the markdown body + title.
+- Optional `PI_JINA_KEY` raises the rate limit (~20 RPM keyless, ~200 RPM
+  with). A Jina failure (rate limit / network) falls through to the
+  no-clean-rung fallback/error (it never hard-fails the extract).
+- `details.backend = "jina"` (distinct from `api`/`local`); the result label
+  is `[Jina Reader fallback after <challenge|no content>]`.
 
 ## 7. Local scraper backend (detailed technique)
 
