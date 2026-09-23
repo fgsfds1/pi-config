@@ -45,6 +45,20 @@ export default function (pi: ExtensionAPI) {
     reload: () => Promise<void>;
   };
 
+  /**
+   * Notify, tolerating a stale ctx. After ctx.reload() the old ctx is
+   * invalidated, so any use of it (even the ctx.ui getter) throws — if
+   * that happens the failure occurred during/after the reload, so log to
+   * the console instead of throwing from the catch block.
+   */
+  const safeNotify = (ctx: Ctx, message: string, type: "info" | "warning" | "error" = "info") => {
+    try {
+      ctx.ui?.notify(message, type);
+    } catch {
+      console.error(`[sync] ${message}`);
+    }
+  };
+
   const rebaseInProgress = (): boolean =>
     existsSync(join(SYNC_DIR, ".git", "rebase-merge")) ||
     existsSync(join(SYNC_DIR, ".git", "rebase-apply"));
@@ -104,10 +118,14 @@ export default function (pi: ExtensionAPI) {
         if (!(await checkDir(ctx as Ctx))) return;
         await pullRebase();
         const head = await git(["rev-parse", "--short", "HEAD"]);
-        await (ctx as Ctx).reload();
+        // Notify before reload: after await ctx.reload() the ctx is stale
+        // and must not be used — treat reload as terminal for this handler.
         ctx.ui?.notify(`✓ Synced pi config to ${head}`, "info");
+        await (ctx as Ctx).reload();
+        return;
       } catch (err) {
-        ctx.ui?.notify(
+        safeNotify(
+          ctx as Ctx,
           `Sync failed: ${err instanceof Error ? err.message : String(err)}`,
           "error",
         );
@@ -151,15 +169,16 @@ export default function (pi: ExtensionAPI) {
         }
         await git(["push"]);
         const head = await git(["rev-parse", "--short", "HEAD"]);
-        await (ctx as Ctx).reload();
+        // Notify before reload: after await ctx.reload() the ctx is stale
+        // and must not be used — treat reload as terminal for this handler.
         ctx.ui?.notify(
-          status
-            ? `✓ Pushed ${head} and reloaded`
-            : `✓ Pushed ${unpushed} pending commit(s) and reloaded`,
+          status ? `✓ Pushed ${head}` : `✓ Pushed ${unpushed} pending commit(s)`,
           "info",
         );
+        await (ctx as Ctx).reload();
+        return;
       } catch (err) {
-        ctx.ui?.notify(`Sync-up failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+        safeNotify(ctx as Ctx, `Sync-up failed: ${err instanceof Error ? err.message : String(err)}`, "error");
       }
     },
   });
