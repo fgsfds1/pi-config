@@ -371,6 +371,8 @@ interface SingleResult {
   stopReason?: string;
   errorMessage?: string;
   step?: number;
+  /** True while the agent process is still running (exitCode not final). */
+  running: boolean;
 }
 
 interface SubagentDetails {
@@ -391,6 +393,7 @@ function getFinalOutput(messages: Message[]): string {
 }
 
 function isFailedResult(result: SingleResult): boolean {
+  if (result.running) return false;
   return (
     result.exitCode !== 0 ||
     result.stopReason === "error" ||
@@ -504,6 +507,7 @@ async function runSingleAgent(
         turns: 0,
       },
       step,
+      running: false,
     };
   }
 
@@ -523,6 +527,7 @@ async function runSingleAgent(
     agentSource: agent.source,
     task,
     exitCode: 0,
+    running: true,
     messages: [],
     stderr: "",
     usage: {
@@ -671,6 +676,7 @@ async function runSingleAgent(
     });
 
     currentResult.exitCode = exitCode;
+    currentResult.running = false;
     if (wasAborted) throw new Error("Subagent was aborted");
     return currentResult;
   } finally {
@@ -938,6 +944,7 @@ export default function (pi: ExtensionAPI) {
             agentSource: "unknown",
             task: params.tasks[i].task,
             exitCode: -1,
+            running: true,
             messages: [],
             stderr: "",
             usage: {
@@ -954,8 +961,8 @@ export default function (pi: ExtensionAPI) {
 
         const emitParallelUpdate = () => {
           if (onUpdate) {
-            const running = allResults.filter((r) => r.exitCode === -1).length;
-            const done = allResults.filter((r) => r.exitCode !== -1).length;
+            const running = allResults.filter((r) => r.running).length;
+            const done = allResults.filter((r) => !r.running).length;
             onUpdate({
               content: [
                 {
@@ -1156,8 +1163,13 @@ export default function (pi: ExtensionAPI) {
       // --- Single ---
       if (details.mode === "single" && details.results.length === 1) {
         const r = details.results[0];
-        const isError = isFailedResult(r);
-        const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        const isRunning = r.running;
+        const isError = !isRunning && isFailedResult(r);
+        const icon = isRunning
+          ? theme.fg("warning", "⏳")
+          : isError
+            ? theme.fg("error", "✗")
+            : theme.fg("success", "✓");
         const displayItems = getDisplayItems(r.messages);
         const finalOutput = getFinalOutput(r.messages);
 
@@ -1243,10 +1255,13 @@ export default function (pi: ExtensionAPI) {
 
       // --- Chain ---
       if (details.mode === "chain") {
-        const successCount = details.results.filter((r) => r.exitCode === 0)
-          .length;
-        const icon =
-          successCount === details.results.length
+        const isRunning = details.results.some((r) => r.running);
+        const successCount = details.results.filter(
+          (r) => !r.running && r.exitCode === 0,
+        ).length;
+        const icon = isRunning
+          ? theme.fg("warning", "⏳")
+          : successCount === details.results.length
             ? theme.fg("success", "✓")
             : theme.fg("error", "✗");
 
@@ -1263,7 +1278,11 @@ export default function (pi: ExtensionAPI) {
             ),
           );
           for (const r of details.results) {
-            const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+            const rIcon = r.running
+              ? theme.fg("warning", "⏳")
+              : r.exitCode === 0
+                ? theme.fg("success", "✓")
+                : theme.fg("error", "✗");
             const displayItems = getDisplayItems(r.messages);
             const finalOutput = getFinalOutput(r.messages);
             container.addChild(new Spacer(1));
@@ -1314,7 +1333,11 @@ export default function (pi: ExtensionAPI) {
           theme.fg("toolTitle", theme.bold("chain ")) +
           theme.fg("accent", `${successCount}/${details.results.length} steps`);
         for (const r of details.results) {
-          const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+          const rIcon = r.running
+            ? theme.fg("warning", "⏳")
+            : r.exitCode === 0
+              ? theme.fg("success", "✓")
+              : theme.fg("error", "✗");
           const displayItems = getDisplayItems(r.messages);
           text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
           if (displayItems.length === 0)
@@ -1329,12 +1352,12 @@ export default function (pi: ExtensionAPI) {
 
       // --- Parallel ---
       if (details.mode === "parallel") {
-        const running = details.results.filter((r) => r.exitCode === -1).length;
+        const running = details.results.filter((r) => r.running).length;
         const successCount = details.results.filter(
-          (r) => r.exitCode !== -1 && !isFailedResult(r),
+          (r) => !r.running && !isFailedResult(r),
         ).length;
         const failCount = details.results.filter(
-          (r) => r.exitCode !== -1 && isFailedResult(r),
+          (r) => !r.running && isFailedResult(r),
         ).length;
         const isRunning = running > 0;
         const icon = isRunning
@@ -1406,7 +1429,7 @@ export default function (pi: ExtensionAPI) {
         let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
         for (const r of details.results) {
           const rIcon =
-            r.exitCode === -1
+            r.running
               ? theme.fg("warning", "⏳")
               : isFailedResult(r)
                 ? theme.fg("error", "✗")
@@ -1414,7 +1437,7 @@ export default function (pi: ExtensionAPI) {
           const displayItems = getDisplayItems(r.messages);
           text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
           if (displayItems.length === 0)
-            text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+            text += `\n${theme.fg("muted", r.running ? "(running...)" : "(no output)")}`;
           else text += `\n${renderDisplayItems(displayItems, 5)}`;
         }
         if (!isRunning) {
