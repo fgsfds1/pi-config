@@ -30,6 +30,38 @@ const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
+// --- Built-in agent toolsets ---
+// Spawned agents receive `--tools <list>`, an allowlist of built-in and
+// extension tool names, so every tool an agent should have must be listed
+// here. (Omitting `tools` grants full access to all tools.)
+//
+// Built-in tools: read, bash, edit, write, grep, find, ls
+// Extension tools (this package): web_search, web_extract, clipboard_read,
+//   clipboard_write, subprocess_spawn, subprocess_status, subprocess_kill,
+//   subagent, list_agents
+// Keep this in sync when adding new extension tools.
+const RECON_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "bash",
+  "web_search",
+  "web_extract",
+];
+const FULL_TOOLS = [
+  ...RECON_TOOLS,
+  "edit",
+  "write",
+  "clipboard_read",
+  "clipboard_write",
+  "subprocess_spawn",
+  "subprocess_status",
+  "subprocess_kill",
+  "subagent",
+  "list_agents",
+];
+
 // --- Built-in agents ---
 const BUILTIN_AGENTS: Array<{
   name: string;
@@ -42,7 +74,7 @@ const BUILTIN_AGENTS: Array<{
     name: "scout",
     description:
       "Fast codebase recon that returns compressed context for handoff to other agents",
-    tools: ["read", "grep", "find", "ls", "bash"],
+    tools: RECON_TOOLS,
     model: undefined, // inherits parent model
     systemPrompt: `You are a scout. Quickly investigate a codebase and return structured findings that another agent can use without re-reading everything.
 
@@ -74,7 +106,7 @@ Which file to look at first and why.`,
     name: "planner",
     description:
       "Creates detailed implementation plans from context provided by scouts or direct requests",
-    tools: ["read", "grep", "find", "ls"],
+    tools: RECON_TOOLS,
     model: undefined, // inherits parent model
     systemPrompt: `You are a planner. Create detailed, actionable implementation plans.
 
@@ -101,7 +133,7 @@ Potential issues or edge cases to watch for.`,
     name: "reviewer",
     description:
       "Code review — checks for bugs, style issues, performance problems, and security concerns",
-    tools: ["read", "grep", "find", "ls", "bash"],
+    tools: RECON_TOOLS,
     model: undefined, // inherits parent model
     systemPrompt: `You are a code reviewer. Review code changes and provide thorough feedback.
 
@@ -129,6 +161,7 @@ Keep feedback specific and actionable. Quote the problematic code and suggest th
     name: "worker",
     description:
       "General-purpose agent with full capabilities for implementation and debugging",
+    tools: FULL_TOOLS,
     model: undefined, // inherits parent model
     systemPrompt: `You are a worker. Execute tasks thoroughly using all available tools.
 
